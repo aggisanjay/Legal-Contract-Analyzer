@@ -42,7 +42,9 @@ export const Navbar: React.FC<NavbarProps> = ({
       <div className="hidden md:flex items-center gap-4">
         {/* Agentic Research Toggle (Part C) */}
         <button
+          type="button"
           onClick={() => onToggleAgent(!useAgent)}
+          aria-label={useAgent ? "Disable Agentic Research mode" : "Enable Agentic Research mode"}
           className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
             useAgent
               ? 'bg-amber-500 text-white shadow-sm shadow-amber-500/30'
@@ -73,7 +75,9 @@ export const Navbar: React.FC<NavbarProps> = ({
       {/* Right Action Buttons */}
       <div className="flex items-center gap-2.5">
         <button
+          type="button"
           onClick={onOpenCompare}
+          aria-label="Open Contract Version Comparison Dialog"
           className="flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition-colors"
         >
           <FileDiff className="w-4 h-4 text-slate-600" />
@@ -81,7 +85,9 @@ export const Navbar: React.FC<NavbarProps> = ({
         </button>
 
         <button
+          type="button"
           onClick={onOpenUpload}
+          aria-label="Upload New Legal Contract Document"
           className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm shadow-blue-600/30 transition-all hover:shadow-md"
         >
           <Upload className="w-4 h-4" />

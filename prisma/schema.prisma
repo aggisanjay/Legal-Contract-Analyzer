@@ -24,6 +24,10 @@ model Document {
   statusMessage    String?
   extractedText    String?        @db.Text
   pageCount        Int            @default(0)
+  pagesJson        Json?          // Array of {pageNumber, startOffset, endOffset}
+  processingStage  String?        // 'Uploading' | 'Extracting text' | 'Splitting into sections' | 'Indexing' | 'Ready'
+  fileData         Bytes?         // Stored original file bytes for serverless persistence
+  renderedPdfData  Bytes?         // Stored rendered PDF bytes for viewer persistence
   originalFilePath String
   renderedPdfPath  String?
   createdAt        DateTime       @default(now())
@@ -59,27 +63,30 @@ model DocumentChunk {
 }
 
 model Conversation {
-  id         String    @id @default(uuid())
-  documentId String?
-  title      String
-  createdAt  DateTime  @default(now())
-  updatedAt  DateTime  @updatedAt
+  id          String    @id @default(uuid())
+  documentId  String?
+  documentIds Json?     // Array of document IDs for multi-document conversations
+  title       String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
-  document   Document? @relation(fields: [documentId], references: [id], onDelete: Cascade)
-  messages   Message[]
+  document    Document? @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  messages    Message[]
 
   @@index([documentId])
   @@index([createdAt])
 }
 
 model Message {
-  id             String       @id @default(uuid())
-  conversationId String
-  role           String       // 'user' | 'assistant' | 'system'
-  content        String       @db.Text
-  citations      Json?        // Verified citations array
-  interrupted    Boolean      @default(false)
-  createdAt      DateTime     @default(now())
+  id              String       @id @default(uuid())
+  conversationId  String
+  role            String       // 'user' | 'assistant' | 'system'
+  content         String       @db.Text
+  citations       Json?        // Verified citations array
+  interrupted     Boolean      @default(false)
+  verifiedCount   Int?
+  unverifiedCount Int?
+  createdAt       DateTime     @default(now())
 
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 

@@ -8,6 +8,7 @@ import { ChatPanel } from '@/components/ChatPanel';
 import { UploadModal } from '@/components/UploadModal';
 import { ComparisonModal } from '@/components/ComparisonModal';
 import { DocumentMetadata, VerifiedCitation } from '@/lib/types';
+import { Layers, FileText, MessageSquare } from 'lucide-react';
 
 export default function Home() {
   const [documents, setDocuments] = useState<DocumentMetadata[]>([]);
@@ -15,6 +16,9 @@ export default function Home() {
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [selectedDocumentIds, setSelectedDocumentIds] = useState<string[]>([]);
   const [activeCitation, setActiveCitation] = useState<VerifiedCitation | null>(null);
+
+  // Responsive mobile/tablet active tab (< 1024px)
+  const [mobileTab, setMobileTab] = useState<'library' | 'viewer' | 'chat'>('viewer');
 
   // Agentic Research (Part C) Mode Toggle
   const [useAgent, setUseAgent] = useState<boolean>(true);
@@ -60,13 +64,13 @@ export default function Home() {
     if (!selectedDocumentIds.includes(doc.id)) {
       setSelectedDocumentIds([doc.id]);
     }
+    setMobileTab('viewer');
   };
 
   const handleToggleDocumentSelection = (docId: string) => {
     setSelectedDocumentIds((prev) => {
       if (prev.includes(docId)) {
-        const next = prev.filter((id) => id !== docId);
-        return next.length > 0 ? next : prev; // Keep at least one selected
+        return prev.filter((id) => id !== docId);
       } else {
         return [...prev, docId];
       }
@@ -89,7 +93,8 @@ export default function Home() {
   const handleUploadSuccess = (newDoc: DocumentMetadata) => {
     setDocuments((prev) => [newDoc, ...prev]);
     setActiveDocumentId(newDoc.id);
-    setSelectedDocumentIds([newDoc.id]);
+    setSelectedDocumentIds((prev) => Array.from(new Set([...prev, newDoc.id])));
+    setMobileTab('viewer');
   };
 
   const handleSelectCitation = (citation: VerifiedCitation) => {
@@ -98,6 +103,7 @@ export default function Home() {
       setActiveDocumentId(citation.documentId);
     }
     setActiveCitation(citation);
+    setMobileTab('viewer');
   };
 
   return (
@@ -111,34 +117,84 @@ export default function Home() {
         onToggleAgent={setUseAgent}
       />
 
+      {/* Mobile/Tablet Sub-Navigation (< 1024px) */}
+      <div className="lg:hidden flex items-center justify-around bg-slate-100 border-b border-slate-200 py-1.5 px-3 shrink-0">
+        <button
+          type="button"
+          onClick={() => setMobileTab('library')}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+            mobileTab === 'library'
+              ? 'bg-white text-blue-600 shadow-2xs'
+              : 'text-slate-600 hover:text-slate-900'
+          }`}
+        >
+          <Layers className="w-3.5 h-3.5" />
+          <span>Library ({documents.length})</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setMobileTab('viewer')}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+            mobileTab === 'viewer'
+              ? 'bg-white text-blue-600 shadow-2xs'
+              : 'text-slate-600 hover:text-slate-900'
+          }`}
+        >
+          <FileText className="w-3.5 h-3.5" />
+          <span>Viewer</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setMobileTab('chat')}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+            mobileTab === 'chat'
+              ? 'bg-white text-blue-600 shadow-2xs'
+              : 'text-slate-600 hover:text-slate-900'
+          }`}
+        >
+          <MessageSquare className="w-3.5 h-3.5" />
+          <span>Assistant</span>
+        </button>
+      </div>
+
       {/* Main 3-Column Workspace */}
       <main className="flex-1 flex overflow-hidden">
         {/* Left: Document Library */}
-        <DocumentLibrary
-          documents={documents}
-          activeDocumentId={activeDocumentId}
-          selectedDocumentIds={selectedDocumentIds}
-          onSelectActiveDocument={handleSelectActiveDocument}
-          onToggleDocumentSelection={handleToggleDocumentSelection}
-          onDeleteDocument={handleDeleteDocument}
-          onOpenUpload={() => setIsUploadModalOpen(true)}
-          isLoading={isLoadingDocs}
-        />
+        <div className={`h-full ${mobileTab === 'library' ? 'flex flex-1' : 'hidden'} lg:flex shrink-0`}>
+          <DocumentLibrary
+            documents={documents}
+            activeDocumentId={activeDocumentId}
+            selectedDocumentIds={selectedDocumentIds}
+            onSelectActiveDocument={handleSelectActiveDocument}
+            onToggleDocumentSelection={handleToggleDocumentSelection}
+            onDeleteDocument={handleDeleteDocument}
+            onOpenUpload={() => setIsUploadModalOpen(true)}
+            isLoading={isLoadingDocs}
+          />
+        </div>
 
-        {/* Center: Document Viewer (PDF.js + Highlighting) */}
-        <DocumentViewer
-          document={activeDocument}
-          activeCitation={activeCitation}
-          onClearActiveCitation={() => setActiveCitation(null)}
-        />
+        {/* Center: Document Viewer (PDF.js + Highlighting + Multi-doc Tabs) */}
+        <div className={`h-full flex-1 ${mobileTab === 'viewer' ? 'flex' : 'hidden'} lg:flex`}>
+          <DocumentViewer
+            document={activeDocument}
+            activeCitation={activeCitation}
+            onClearActiveCitation={() => setActiveCitation(null)}
+            selectedDocuments={selectedDocuments}
+            onSelectDocument={handleSelectActiveDocument}
+          />
+        </div>
 
         {/* Right: AI Assistant Chat */}
-        <ChatPanel
-          activeDocument={activeDocument}
-          selectedDocuments={selectedDocuments}
-          useAgent={useAgent}
-          onSelectCitation={handleSelectCitation}
-        />
+        <div className={`h-full ${mobileTab === 'chat' ? 'flex flex-1' : 'hidden'} lg:flex shrink-0`}>
+          <ChatPanel
+            activeDocument={activeDocument}
+            selectedDocuments={selectedDocuments}
+            useAgent={useAgent}
+            onSelectCitation={handleSelectCitation}
+          />
+        </div>
       </main>
 
       {/* Upload Modal */}

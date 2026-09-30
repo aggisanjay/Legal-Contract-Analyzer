@@ -7,31 +7,39 @@ import { AgentProgressEvent, VerifiedCitation } from '../types';
 
 export const SearchDocumentSchema = z.object({
   query: z.string().min(1, 'Query must not be empty'),
+  documentId: z.string().optional(),
   topK: z.number().int().positive().optional().default(4),
 });
 
 export const GetSectionSchema = z.object({
   sectionNumber: z.string().min(1, 'Section number must not be empty'),
+  documentId: z.string().optional(),
 });
 
-export const ListClausesSchema = z.object({});
+export const ListClausesSchema = z.object({
+  documentId: z.string().optional(),
+});
 
 export const AGENT_TOOLS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
       name: 'search_document',
-      description: 'Search the contract for specific clauses, terms, numbers, or topics using semantic retrieval.',
+      description: 'Search contract clauses and text for specific terms, topics, or numbers.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'The search query, e.g. "customer termination early" or "liability cap"',
+            description: 'The search query or clause topic',
+          },
+          documentId: {
+            type: 'string',
+            description: 'Optional document ID to search within in multi-document mode',
           },
           topK: {
             type: 'integer',
-            description: 'Number of chunks to return (default 4)',
+            description: 'Number of passages to return (default 4)',
           },
         },
         required: ['query'],
@@ -42,13 +50,17 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'get_section',
-      description: 'Retrieve the full text of a specific contract section or clause by its number.',
+      description: 'Retrieve the full text of a specific contract section by its number.',
       parameters: {
         type: 'object',
         properties: {
           sectionNumber: {
             type: 'string',
-            description: 'The section or clause number, e.g. "12", "14.2", or "5"',
+            description: 'The section or clause number, e.g. "12", "14.2", "5"',
+          },
+          documentId: {
+            type: 'string',
+            description: 'Optional document ID',
           },
         },
         required: ['sectionNumber'],
@@ -62,7 +74,12 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       description: 'List all indexed section numbers and clause headings in the contract.',
       parameters: {
         type: 'object',
-        properties: {},
+        properties: {
+          documentId: {
+            type: 'string',
+            description: 'Optional document ID',
+          },
+        },
       },
     },
   },
@@ -70,9 +87,10 @@ export const AGENT_TOOLS: ToolDefinition[] = [
 
 export interface RunAgentOptions {
   documentId: string;
+  documentIds?: string[];
   documentName?: string;
   question: string;
-  onProgress?: (event: AgentProgressEvent) => void;
+  onProgress?: (event: AgentProgressEvent & { resultSummary?: string }) => void;
   maxRounds?: number;
 }
 
@@ -82,18 +100,28 @@ export interface AgentResult {
   roundsExecuted: number;
 }
 
+const MAX_CHAR_BUDGET = 70000;
+const MAX_TOOLS_PER_ROUND = 4;
+
 /**
- * Executes Part C: Agentic Document Research.
+ * Executes Part C: Hardened Agentic Document Research with tool step timelines,
+ * character budget limits, multi-document capability, and structured quote verification.
  */
 export async function runAgenticDocumentResearch(
   options: RunAgentOptions
 ): Promise<AgentResult> {
-  const { documentId, documentName = 'contract.pdf', question, onProgress } = options;
+  const {
+    documentId,
+    documentIds = [documentId],
+    documentName = 'contract.pdf',
+    question,
+    onProgress,
+  } = options;
   const maxRounds = options.maxRounds || parseInt(process.env.MAX_AGENT_ROUNDS || '5', 10) || 5;
 
   onProgress?.({
     stage: 'searching',
-    message: `Initiating agent research for: "${question.slice(0, 50)}..."`,
+    message: `Initiating agent research: "${question.slice(0, 50)}..."`,
     round: 1,
   });
 
@@ -104,12 +132,14 @@ export async function runAgenticDocumentResearch(
     },
     {
       role: 'user',
-      content: `Analyze this contract to answer the following question:\n"${question}"\n\nUse your research tools to explore the document before answering. Output your final response in valid JSON.`,
+      content: `Analyze this contract to answer the following question:\n"${question}"\n\nUse your research tools to explore the document before answering. Structure your final answer with prose and inline markers [[1]], [[2]], followed by delimiter "---QUOTES---" and the JSON array of candidate quotes.`,
     },
   ];
 
   let round = 0;
-  let finalJsonString: string | null = null;
+  let finalResponseText: string | null = null;
+  let totalCharsAccumulated = 0;
+  let hitBudgetLimit = false;
 
   while (round < maxRounds) {
     round++;
@@ -119,6 +149,12 @@ export async function runAgenticDocumentResearch(
       message: `Agent reasoning (Round ${round} of ${maxRounds})...`,
       round,
     });
+
+    // Check token / character budget guard
+    if (totalCharsAccumulated > MAX_CHAR_BUDGET) {
+      hitBudgetLimit = true;
+      break;
+    }
 
     let completion;
     try {
@@ -131,7 +167,7 @@ export async function runAgenticDocumentResearch(
       const msg = err instanceof Error ? err.message : 'AI completion failed';
       onProgress?.({
         stage: 'error',
-        message: `Research round error: ${msg}. Retrying...`,
+        message: `Research round error: ${msg}. Finalizing with gathered evidence.`,
         round,
       });
       break;
@@ -139,7 +175,6 @@ export async function runAgenticDocumentResearch(
 
     const toolCalls = completion.tool_calls;
 
-    // Check if the agent wants to execute tool calls
     if (toolCalls && toolCalls.length > 0) {
       // Append assistant's tool call message
       messages.push({
@@ -148,47 +183,48 @@ export async function runAgenticDocumentResearch(
         tool_calls: toolCalls,
       });
 
-      for (const call of toolCalls) {
+      // Cap tool calls per round at MAX_TOOLS_PER_ROUND (e.g. 4)
+      const callsToRun = toolCalls.slice(0, MAX_TOOLS_PER_ROUND);
+
+      for (const call of callsToRun) {
         const toolName = call.function.name;
         let parsedArgs: Record<string, unknown> = {};
 
         try {
           parsedArgs = JSON.parse(call.function.arguments || '{}');
         } catch {
-          // Malformed JSON arguments
+          const errRes = { error: 'Malformed JSON arguments. Please provide valid parameters.' };
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
             name: toolName,
-            content: JSON.stringify({
-              error: 'Malformed JSON arguments. Please provide valid JSON parameters.',
-            }),
+            content: JSON.stringify(errRes),
           });
           onProgress?.({
             stage: 'error',
-            message: `Malformed arguments in tool call: ${toolName}. Recovering...`,
+            message: `Malformed arguments in tool: ${toolName}`,
+            toolCall: { tool: toolName, args: {} },
+            resultSummary: 'Malformed arguments',
             round,
           });
           continue;
         }
 
-        // Validate and execute tool
+        // Target document resolution
+        const targetDocId = (parsedArgs.documentId as string) || documentId;
+
         if (toolName === 'search_document') {
           const validated = SearchDocumentSchema.safeParse(parsedArgs);
           if (!validated.success) {
+            const errRes = {
+              error: 'Validation failed for search_document',
+              issues: validated.error.issues,
+            };
             messages.push({
               role: 'tool',
               tool_call_id: call.id,
               name: toolName,
-              content: JSON.stringify({
-                error: 'Validation failed for search_document',
-                issues: validated.error.issues,
-              }),
-            });
-            onProgress?.({
-              stage: 'error',
-              message: `Invalid search arguments: ${validated.error.issues[0]?.message}`,
-              round,
+              content: JSON.stringify(errRes),
             });
             continue;
           }
@@ -201,29 +237,35 @@ export async function runAgenticDocumentResearch(
           });
 
           const chunks = await retrieveChunksForDocument(
-            documentId,
+            targetDocId,
             validated.data.query,
             validated.data.topK
           );
 
+          const summary = `Found ${chunks.length} passages for "${validated.data.query}"`;
           onProgress?.({
             stage: 'reading',
-            message: `Found ${chunks.length} relevant passages for "${validated.data.query}".`,
+            message: summary,
+            toolCall: { tool: 'search_document', args: validated.data },
+            resultSummary: summary,
             round,
           });
 
+          const content = JSON.stringify({
+            results: chunks.map((c) => ({
+              chunkId: c.id,
+              documentId: targetDocId,
+              section: c.sectionTitle ? `${c.sectionNumber || ''} - ${c.sectionTitle}` : undefined,
+              page: c.pageStart,
+              text: c.text,
+            })),
+          });
+          totalCharsAccumulated += content.length;
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
             name: toolName,
-            content: JSON.stringify({
-              results: chunks.map((c) => ({
-                chunkId: c.id,
-                section: c.sectionTitle ? `${c.sectionNumber || ''} - ${c.sectionTitle}` : undefined,
-                page: c.pageStart,
-                text: c.text,
-              })),
-            }),
+            content,
           });
         } else if (toolName === 'get_section') {
           const validated = GetSectionSchema.safeParse(parsedArgs);
@@ -232,165 +274,150 @@ export async function runAgenticDocumentResearch(
               role: 'tool',
               tool_call_id: call.id,
               name: toolName,
-              content: JSON.stringify({
-                error: 'Validation failed for get_section',
-                issues: validated.error.issues,
-              }),
-            });
-            onProgress?.({
-              stage: 'error',
-              message: `Invalid section arguments: ${validated.error.issues[0]?.message}`,
-              round,
+              content: JSON.stringify({ error: 'Validation failed for get_section' }),
             });
             continue;
           }
 
           onProgress?.({
             stage: 'reading',
-            message: `Reading Section ${validated.data.sectionNumber}...`,
+            message: `Reading section: "${validated.data.sectionNumber}"...`,
             toolCall: { tool: 'get_section', args: validated.data },
             round,
           });
 
-          const sec = await getSectionContent(documentId, validated.data.sectionNumber);
-
-          if (!sec) {
-            messages.push({
-              role: 'tool',
-              tool_call_id: call.id,
-              name: toolName,
-              content: JSON.stringify({
-                error: `Section "${validated.data.sectionNumber}" not found in contract index.`,
-              }),
-            });
-            onProgress?.({
-              stage: 'reading',
-              message: `Section ${validated.data.sectionNumber} not found. Continuing search...`,
-              round,
-            });
-          } else {
-            messages.push({
-              role: 'tool',
-              tool_call_id: call.id,
-              name: toolName,
-              content: JSON.stringify({
-                sectionNumber: sec.sectionNumber,
-                pageStart: sec.pageStart,
-                pageEnd: sec.pageEnd,
-                text: sec.text,
-              }),
-            });
-            onProgress?.({
-              stage: 'reading',
-              message: `Retrieved Section ${sec.sectionNumber} (Pages ${sec.pageStart}-${sec.pageEnd}).`,
-              round,
-            });
-          }
-        } else if (toolName === 'list_clauses') {
-          const validated = ListClausesSchema.safeParse(parsedArgs);
-          if (!validated.success) {
-            messages.push({
-              role: 'tool',
-              tool_call_id: call.id,
-              name: toolName,
-              content: JSON.stringify({ error: 'Validation failed' }),
-            });
-            continue;
-          }
+          const section = await getSectionContent(targetDocId, validated.data.sectionNumber);
+          const summary = section ? `Read ${section.text.length} chars from section ${section.sectionNumber}` : 'Section not found';
 
           onProgress?.({
-            stage: 'searching',
-            message: 'Listing all indexed contract clauses...',
+            stage: 'reading',
+            message: summary,
+            toolCall: { tool: 'get_section', args: validated.data },
+            resultSummary: summary,
+            round,
+          });
+
+          const content = JSON.stringify(section || { error: `Section ${validated.data.sectionNumber} not found.` });
+          totalCharsAccumulated += content.length;
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            name: toolName,
+            content,
+          });
+        } else if (toolName === 'list_clauses') {
+          onProgress?.({
+            stage: 'reading',
+            message: 'Listing contract clauses and sections...',
             toolCall: { tool: 'list_clauses', args: {} },
             round,
           });
 
-          const clauses = await listDocumentClauses(documentId);
-          messages.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            name: toolName,
-            content: JSON.stringify({ clauses }),
-          });
+          const clauses = await listDocumentClauses(targetDocId);
+          const summary = `Found ${clauses.length} indexed clauses`;
 
           onProgress?.({
             stage: 'reading',
-            message: `Indexed ${clauses.length} contract clauses.`,
+            message: summary,
+            toolCall: { tool: 'list_clauses', args: {} },
+            resultSummary: summary,
             round,
           });
-        } else {
-          // Unknown tool call: structured recovery
+
+          const content = JSON.stringify({ clauses });
+          totalCharsAccumulated += content.length;
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
             name: toolName,
-            content: JSON.stringify({
-              error: `Unknown tool "${toolName}". Available tools are search_document, get_section, and list_clauses.`,
-            }),
+            content,
+          });
+        } else {
+          // Unknown tool name: structured error with valid tools list
+          const errorMsg = `Unknown tool "${toolName}". Valid tools: search_document, get_section, list_clauses.`;
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            name: toolName,
+            content: JSON.stringify({ error: errorMsg }),
           });
           onProgress?.({
             stage: 'error',
-            message: `The requested research operation "${toolName}" was invalid. Retrying with available tools.`,
+            message: errorMsg,
+            toolCall: { tool: toolName, args: {} },
+            resultSummary: 'Invalid tool name',
             round,
           });
         }
       }
     } else if (completion.content) {
-      // The agent provided a final textual response
-      finalJsonString = completion.content;
+      finalResponseText = completion.content;
       break;
     } else {
       break;
     }
   }
 
-  // If no final JSON was formulated, ask the model to synthesize from gathered evidence
-  if (!finalJsonString) {
+  // If cap was hit or budget was exceeded, force a final answer call with tools disabled
+  if (!finalResponseText) {
+    const forcedReason = hitBudgetLimit
+      ? 'Context budget reached.'
+      : `Research stopped at ${round} rounds.`;
+
     onProgress?.({
       stage: 'generating',
-      message: 'Synthesizing evidence and finalizing answer...',
+      message: `${forcedReason} Formulating final verified response...`,
       round,
     });
 
     messages.push({
       role: 'user',
-      content:
-        'Please formulate your final answer based on the retrieved evidence. Output JSON with "answer" and "citations".',
+      content: `${forcedReason} Please formulate your final legal answer using only the gathered evidence. Include inline citations [[1]], [[2]], followed by the delimiter "---QUOTES---" and the JSON array of candidate quotes.`,
     });
 
     try {
       const finalComp = await aiClient.createChatCompletion({
         messages,
         temperature: 0.1,
-        responseFormatJson: true,
       });
-      finalJsonString = finalComp.content || '';
+      finalResponseText = finalComp.content || '';
     } catch {
-      finalJsonString = JSON.stringify({
-        answer: "I couldn't find sufficient evidence in the uploaded contract to answer this reliably.",
-        citations: [],
-      });
+      finalResponseText =
+        "I couldn't find sufficient evidence in the uploaded contract to answer this reliably.";
     }
   }
 
-  // Parse structured answer
-  let parsedAnswer = "I couldn't find sufficient evidence in the uploaded contract to answer this reliably.";
-  let candidateCitations: Array<{ quote: string; chunkId?: string }> = [];
+  // Parse prose and quotes from finalResponseText
+  const DELIMITER = '---QUOTES---';
+  let answerProse = finalResponseText;
+  let quotesJson = '';
 
-  try {
-    const jsonMatch = finalJsonString?.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      if (parsed.answer) parsedAnswer = parsed.answer;
-      if (Array.isArray(parsed.citations)) candidateCitations = parsed.citations;
-    } else {
-      parsedAnswer = finalJsonString || parsedAnswer;
-    }
-  } catch {
-    parsedAnswer = finalJsonString || parsedAnswer;
+  const delimIdx = finalResponseText.indexOf(DELIMITER);
+  if (delimIdx !== -1) {
+    answerProse = finalResponseText.slice(0, delimIdx).trim();
+    quotesJson = finalResponseText.slice(delimIdx + DELIMITER.length).trim();
   }
 
-  // Step: Backend Quote Verification
+  let candidateCitations: Array<{ id?: number; documentId?: string; quote: string; chunkId?: string }> = [];
+  if (quotesJson) {
+    try {
+      const match = quotesJson.match(/\[[\s\S]*\]/);
+      if (match) {
+        candidateCitations = JSON.parse(match[0]);
+      }
+    } catch {
+      // Fallback regex extraction if JSON was slightly malformed
+      const regexQuotes = Array.from(quotesJson.matchAll(/"quote"\s*:\s*"([^"]+)"/g));
+      candidateCitations = regexQuotes.map((m, idx) => ({ id: idx + 1, quote: m[1] }));
+    }
+  }
+
+  // If user hit rounds cap, prepend notice if not already present
+  if (round >= maxRounds && !answerProse.includes(`Research stopped at ${maxRounds} rounds`)) {
+    answerProse = `Research stopped at ${maxRounds} rounds.\n\n${answerProse}`;
+  }
+
+  // Verify quotes against canonical document text
   onProgress?.({
     stage: 'verifying',
     message: 'Verifying citations against canonical document text...',
@@ -403,16 +430,13 @@ export async function runAgenticDocumentResearch(
     const candidate = candidateCitations[i];
     if (!candidate.quote) continue;
 
-    const vResult = await verifyQuoteForDocument(
-      documentId,
-      candidate.quote,
-      candidate.chunkId
-    );
+    const docToVerify = candidate.documentId || documentId;
+    const vResult = await verifyQuoteForDocument(docToVerify, candidate.quote, candidate.chunkId);
 
     if (vResult.verified) {
       verifiedCitations.push({
         id: `cit_${Date.now()}_${i}`,
-        documentId,
+        documentId: docToVerify,
         documentName,
         quote: vResult.quote,
         verified: true,
@@ -422,19 +446,18 @@ export async function runAgenticDocumentResearch(
         pageEnd: vResult.pageEnd,
       });
     } else {
-      // Per Section 21: Unsupported or hallucinated quotes must NEVER be shown as verified!
-      console.warn(`Quote verification rejected unverified quote: "${candidate.quote}"`);
+      console.warn(`[Agent] Rejected unverified quote: "${candidate.quote}" (${vResult.reason})`);
     }
   }
 
   onProgress?.({
     stage: 'done',
-    message: `Answer ready with ${verifiedCitations.length} verified citation${verifiedCitations.length === 1 ? '' : 's'}.`,
+    message: `Research complete with ${verifiedCitations.length} verified citation${verifiedCitations.length === 1 ? '' : 's'}.`,
     round,
   });
 
   return {
-    answer: parsedAnswer,
+    answer: answerProse,
     citations: verifiedCitations,
     roundsExecuted: round,
   };

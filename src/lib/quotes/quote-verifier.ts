@@ -22,9 +22,12 @@ export interface NormalizedTextMap {
 /**
  * Normalizes text while maintaining an exact character index mapping back to original text.
  * Handles:
- * - Unicode NFKC normalization
+ * - Unicode NFKC normalization with per-output-character mapping (ligatures ﬁ, ﬂ, ﬀ, fractions, etc.)
+ * - Stripping soft hyphens (\u00AD)
+ * - Handling words hyphenated across line breaks ("terminat-\ned" -> "terminated")
  * - Converting multiple spaces, tabs, carriage returns, and newlines to a single space
  * - Smart quotes, dashes, non-breaking spaces
+ * Invariant: normalized.length === origIndexMap.length is always guaranteed.
  */
 export function normalizeTextWithMap(text: string): NormalizedTextMap {
   if (!text) {
@@ -35,38 +38,87 @@ export function normalizeTextWithMap(text: string): NormalizedTextMap {
   const origIndexMap: number[] = [];
 
   let inWhitespace = false;
+  let i = 0;
 
-  for (let i = 0; i < text.length; i++) {
-    let char = text[i];
-
-    // Normalize Unicode NFKC
-    char = char.normalize('NFKC');
-
-    // Normalize curly quotes / dashes / special whitespace
-    if (char === '\u201C' || char === '\u201D' || char === '«' || char === '»' || char === '„') {
-      char = '"';
-    } else if (char === '\u2018' || char === '\u2019' || char === '`') {
-      char = "'";
-    } else if (char === '\u2013' || char === '\u2014' || char === '\u2212') {
-      char = '-';
-    } else if (char === '\u00A0' || char === '\u200B' || char === '\u202F' || char === '\uFEFF') {
-      char = ' ';
+  while (i < text.length) {
+    // 1. Strip soft hyphens (\u00AD)
+    if (text[i] === '\u00AD') {
+      i++;
+      continue;
     }
 
-    const isWhitespace = /\s/.test(char);
+    // 2. Handle words hyphenated across line breaks: e.g. "terminat-\ned" -> "terminated"
+    const isHyphenChar = text[i] === '-' || text[i] === '\u2010' || text[i] === '\u2011';
+    if (isHyphenChar) {
+      const prevNormChar = normalizedChars.length > 0 ? normalizedChars[normalizedChars.length - 1] : '';
+      const isPrecededByWordChar = /[a-zA-Z0-9]/.test(prevNormChar);
 
-    if (isWhitespace) {
-      if (!inWhitespace) {
-        normalizedChars.push(' ');
-        origIndexMap.push(i);
-        inWhitespace = true;
+      if (isPrecededByWordChar) {
+        let lookahead = i + 1;
+        while (lookahead < text.length && (text[lookahead] === ' ' || text[lookahead] === '\t')) {
+          lookahead++;
+        }
+
+        let hasLineBreak = false;
+        if (lookahead < text.length && text[lookahead] === '\r') {
+          hasLineBreak = true;
+          lookahead++;
+        }
+        if (lookahead < text.length && text[lookahead] === '\n') {
+          hasLineBreak = true;
+          lookahead++;
+        }
+
+        if (hasLineBreak) {
+          while (lookahead < text.length && (text[lookahead] === ' ' || text[lookahead] === '\t')) {
+            lookahead++;
+          }
+
+          // If followed by a word character, join the hyphenated word
+          if (lookahead < text.length && /[a-zA-Z0-9]/.test(text[lookahead])) {
+            i = lookahead;
+            inWhitespace = false;
+            continue;
+          }
+        }
       }
-      // Collapse subsequent whitespaces
-    } else {
-      normalizedChars.push(char);
-      origIndexMap.push(i);
-      inWhitespace = false;
     }
+
+    // 3. Normal character processing with NFKC expansion
+    const rawChar = text[i];
+    const expanded = rawChar.normalize('NFKC');
+
+    for (let c = 0; c < expanded.length; c++) {
+      let char = expanded[c];
+
+      // Normalize curly quotes / dashes / special whitespace
+      if (char === '\u201C' || char === '\u201D' || char === '«' || char === '»' || char === '„') {
+        char = '"';
+      } else if (char === '\u2018' || char === '\u2019' || char === '`') {
+        char = "'";
+      } else if (char === '\u2013' || char === '\u2014' || char === '\u2212') {
+        char = '-';
+      } else if (char === '\u00A0' || char === '\u200B' || char === '\u202F' || char === '\uFEFF') {
+        char = ' ';
+      }
+
+      const isWhitespace = /\s/.test(char);
+
+      if (isWhitespace) {
+        if (!inWhitespace) {
+          normalizedChars.push(' ');
+          origIndexMap.push(i);
+          inWhitespace = true;
+        }
+        // Collapse subsequent whitespaces
+      } else {
+        normalizedChars.push(char);
+        origIndexMap.push(i);
+        inWhitespace = false;
+      }
+    }
+
+    i++;
   }
 
   return {
@@ -224,6 +276,16 @@ export function verifyQuote(options: QuoteVerifierOptions): QuoteVerificationRes
     };
   }
 
+  // Minimum quote length check: at least 25 characters or 5 words
+  const words = normQuote.trim().split(/\s+/).filter(Boolean);
+  if (normQuote.length < 25 && words.length < 5) {
+    return {
+      verified: false,
+      quote: candidateQuote,
+      reason: 'Quote is too short to be meaningful evidence (minimum 25 characters or 5 words required).',
+    };
+  }
+
   // Step 2: Normalize Document with character position mapping
   const docMap = normalizeTextWithMap(canonicalText);
 
@@ -235,24 +297,19 @@ export function verifyQuote(options: QuoteVerifierOptions): QuoteVerificationRes
     matches = findAllMatches(docMap.normalized, normQuote, true);
   }
 
-  // Step 5: If still not found, try stripping trailing punctuation from candidate
+  // Step 5: If candidate quote ends with trailing punctuation that is not present in document,
+  // allow stripping ONLY the trailing punctuation characters without loosening text matching
   if (matches.length === 0) {
-    const trimmedPunct = normQuote.replace(/[.,;:]+$/, '').trim();
-    if (trimmedPunct.length > 5) {
+    const trimmedPunct = normQuote.replace(/[.,;:!?'"“”'’]+$/, '').trim();
+    if (
+      trimmedPunct !== normQuote &&
+      (trimmedPunct.length >= 25 || trimmedPunct.split(/\s+/).filter(Boolean).length >= 5)
+    ) {
       matches = findAllMatches(docMap.normalized, trimmedPunct, true);
     }
   }
 
-  // Step 6: If still not found, check if it's within candidate chunk specifically (handling minor formatting differences)
-  if (matches.length === 0 && candidateChunk) {
-    // If not found anywhere in document, mark as unverified
-    return {
-      verified: false,
-      quote: candidateQuote,
-      reason: 'Quote could not be located in the document.',
-    };
-  }
-
+  // Step 6: If still not found, check if it's within candidate chunk specifically
   if (matches.length === 0) {
     return {
       verified: false,
@@ -338,38 +395,42 @@ export async function verifyQuoteForDocument(
     };
   }
 
-  // Reconstruct pages map from chunks or pageCount
+  // Build page ranges from the real per-page offsets stored in pagesJson at extraction time
   const pages: PageInfo[] = [];
-  const sortedChunks = [...doc.chunks].sort((a, b) => a.startOffset - b.startOffset);
-
-  const pageBounds = new Map<number, { startOffset: number; endOffset: number }>();
-  for (const chunk of sortedChunks) {
-    for (let p = chunk.pageStart; p <= chunk.pageEnd; p++) {
-      const existing = pageBounds.get(p);
-      if (!existing) {
-        pageBounds.set(p, { startOffset: chunk.startOffset, endOffset: chunk.endOffset });
-      } else {
-        pageBounds.set(p, {
-          startOffset: Math.min(existing.startOffset, chunk.startOffset),
-          endOffset: Math.max(existing.endOffset, chunk.endOffset),
-        });
-      }
-    }
-  }
-
-  for (let p = 1; p <= Math.max(doc.pageCount, 1); p++) {
-    const b = pageBounds.get(p);
-    if (b) {
-      pages.push({ pageNumber: p, startOffset: b.startOffset, endOffset: b.endOffset });
-    } else {
-      const len = doc.extractedText.length;
-      const step = Math.floor(len / Math.max(doc.pageCount, 1));
+  if (Array.isArray(doc.pagesJson) && doc.pagesJson.length > 0) {
+    const rawPages = doc.pagesJson as unknown as Array<{
+      pageNumber: number;
+      startOffset: number;
+      endOffset: number;
+    }>;
+    for (const p of rawPages) {
       pages.push({
-        pageNumber: p,
-        startOffset: (p - 1) * step,
-        endOffset: p === doc.pageCount ? len : p * step,
+        pageNumber: p.pageNumber,
+        startOffset: p.startOffset,
+        endOffset: p.endOffset,
       });
     }
+  } else if (doc.chunks && doc.chunks.length > 0) {
+    // If pagesJson is not yet populated for older docs, use sorted chunks without division fallback
+    const sortedChunks = [...doc.chunks].sort((a, b) => a.startOffset - b.startOffset);
+    const pageBounds = new Map<number, { startOffset: number; endOffset: number }>();
+    for (const chunk of sortedChunks) {
+      for (let p = chunk.pageStart; p <= chunk.pageEnd; p++) {
+        const existing = pageBounds.get(p);
+        if (!existing) {
+          pageBounds.set(p, { startOffset: chunk.startOffset, endOffset: chunk.endOffset });
+        } else {
+          pageBounds.set(p, {
+            startOffset: Math.min(existing.startOffset, chunk.startOffset),
+            endOffset: Math.max(existing.endOffset, chunk.endOffset),
+          });
+        }
+      }
+    }
+    for (const [p, b] of pageBounds.entries()) {
+      pages.push({ pageNumber: p, startOffset: b.startOffset, endOffset: b.endOffset });
+    }
+    pages.sort((a, b) => a.pageNumber - b.pageNumber);
   }
 
   const candidateChunk = candidateChunkId

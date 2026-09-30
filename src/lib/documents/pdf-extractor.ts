@@ -70,8 +70,11 @@ export async function extractPdfText(pdfBuffer: Buffer): Promise<ExtractedDocume
   }
 
   // Detect empty or scanned PDF:
-  // A scanned PDF typically has 0 extracted characters or very few OCR noise characters (< 30 across document)
-  const isScannedOrEmpty = totalNonWhitespaceChars < 25;
+  // A scanned PDF typically has < 25 extracted characters across the entire document.
+  // Also treat a PDF where MORE than 90% of pages have < 20 characters as scanned.
+  const sparsePagesCount = pages.filter((p) => p.text.replace(/\s+/g, '').length < 20).length;
+  const isSparsePdf = pages.length > 0 && sparsePagesCount / pages.length > 0.9;
+  const isScannedOrEmpty = totalNonWhitespaceChars < 25 || isSparsePdf;
 
   // Extract detected sections from canonical text
   const sections = detectSections(canonicalFullText, pages);

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   X,
   UploadCloud,
@@ -8,7 +8,8 @@ import {
   CheckCircle2,
   AlertCircle,
   Loader2,
-  FileCheck,
+  Trash2,
+  RotateCcw,
 } from 'lucide-react';
 import { DocumentMetadata } from '@/lib/types';
 
@@ -17,16 +18,35 @@ interface UploadModalProps {
   onSuccess: (newDoc: DocumentMetadata) => void;
 }
 
-type Stage = 'idle' | 'uploading' | 'extracting' | 'indexing' | 'ready' | 'failed';
+const STAGES = [
+  'Uploading',
+  'Extracting text',
+  'Splitting into sections',
+  'Indexing',
+  'Ready',
+];
 
 export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) => {
   const [dragActive, setDragActive] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [stage, setStage] = useState<Stage>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [resultDoc, setResultDoc] = useState<DocumentMetadata | null>(null);
+  const [uploadedDocId, setUploadedDocId] = useState<string | null>(null);
+  const [currentStage, setCurrentStage] = useState<string>('Uploading');
+  const [progressPercent, setProgressPercent] = useState<number>(0);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [isFailed, setIsFailed] = useState<boolean>(false);
+  const [failureReason, setFailureReason] = useState<string | null>(null);
+  const [readyDoc, setReadyDoc] = useState<DocumentMetadata | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pollTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Clean up polling interval on unmount
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    };
+  }, []);
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -58,7 +78,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
     setErrorMessage(null);
     const ext = file.name.split('.').pop()?.toLowerCase();
     if (ext !== 'pdf' && ext !== 'docx') {
-      setErrorMessage('Unsupported file type. Please upload a PDF or DOCX contract.');
+      setErrorMessage('Unsupported file type. Please upload a PDF or DOCX.');
       setSelectedFile(null);
       return;
     }
@@ -72,25 +92,59 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
     setSelectedFile(file);
   };
 
+  const startPollingStatus = (docId: string) => {
+    if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+
+    pollTimerRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/documents/${docId}/status`);
+        if (!res.ok) return;
+
+        const data = await res.json();
+        setCurrentStage(data.stage || 'Extracting text');
+        setProgressPercent(data.progress ?? 30);
+
+        if (data.status === 'READY') {
+          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+          setIsProcessing(false);
+          setCurrentStage('Ready');
+          setProgressPercent(100);
+
+          // Fetch full document metadata
+          const docRes = await fetch('/api/documents');
+          if (docRes.ok) {
+            const listData = await docRes.json();
+            const found = (listData.documents || []).find((d: DocumentMetadata) => d.id === docId);
+            if (found) {
+              setReadyDoc(found);
+              onSuccess(found);
+            }
+          }
+        } else if (data.status === 'FAILED') {
+          if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+          setIsProcessing(false);
+          setIsFailed(true);
+          setFailureReason(data.message || 'Processing was interrupted. Please upload again.');
+        }
+      } catch (err) {
+        console.warn('Status poll failed:', err);
+      }
+    }, 1000);
+  };
+
   const handleStartUpload = async () => {
     if (!selectedFile) return;
 
-    setStage('uploading');
+    setIsProcessing(true);
+    setIsFailed(false);
     setErrorMessage(null);
+    setCurrentStage('Uploading');
+    setProgressPercent(15);
 
     const formData = new FormData();
     formData.append('file', selectedFile);
 
     try {
-      // Stage transition simulation for visual feedback
-      setTimeout(() => {
-        if (stage !== 'failed') setStage('extracting');
-      }, 700);
-
-      setTimeout(() => {
-        if (stage !== 'failed') setStage('indexing');
-      }, 1500);
-
       const res = await fetch('/api/documents', {
         method: 'POST',
         body: formData,
@@ -99,40 +153,61 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
       const data = await res.json();
 
       if (!res.ok || data.error) {
-        setStage('failed');
-        setErrorMessage(data.error || 'Unable to process this document.');
+        setIsProcessing(false);
+        setIsFailed(true);
+        setFailureReason(data.error || 'Upload failed. Please upload a valid PDF or DOCX.');
         return;
       }
 
-      const doc: DocumentMetadata = data.document;
+      const docId = data.id || data.document?.id;
+      setUploadedDocId(docId);
+      setCurrentStage('Extracting text');
+      setProgressPercent(30);
 
-      if (doc.status === 'FAILED') {
-        setStage('failed');
-        setErrorMessage(
-          doc.statusMessage ||
-            'This PDF appears to be scanned or contains no readable text. Please upload a text-based PDF or DOCX.'
-        );
-        return;
-      }
-
-      setStage('ready');
-      setResultDoc(doc);
-      onSuccess(doc);
+      // Start polling status
+      startPollingStatus(docId);
     } catch (err: unknown) {
-      setStage('failed');
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Unable to process this document.'
-      );
+      setIsProcessing(false);
+      setIsFailed(true);
+      setFailureReason(err instanceof Error ? err.message : 'Unable to upload file.');
     }
   };
 
+  const handleDeleteFailed = async () => {
+    if (uploadedDocId) {
+      try {
+        await fetch(`/api/documents/${uploadedDocId}`, { method: 'DELETE' });
+      } catch {
+        // Ignore
+      }
+    }
+    handleReset();
+  };
+
+  const handleReset = () => {
+    if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    setSelectedFile(null);
+    setUploadedDocId(null);
+    setIsProcessing(false);
+    setIsFailed(false);
+    setFailureReason(null);
+    setReadyDoc(null);
+    setProgressPercent(0);
+    setCurrentStage('Uploading');
+  };
+
+  const getStageIndex = (stageName: string) => {
+    return STAGES.indexOf(stageName);
+  };
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4">
       <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl overflow-hidden border border-slate-200">
         {/* Header */}
         <div className="p-5 border-b border-slate-100 flex items-center justify-between">
           <h2 className="font-bold text-sm text-slate-900">Upload Contract Document</h2>
           <button
+            type="button"
             onClick={onClose}
             className="p-1 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100"
           >
@@ -142,9 +217,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
 
         {/* Content */}
         <div className="p-6">
-          {stage === 'idle' && (
+          {/* 1. File Selection State */}
+          {!isProcessing && !isFailed && !readyDoc && (
             <>
-              {/* Drop Zone */}
               <div
                 onDragEnter={handleDrag}
                 onDragLeave={handleDrag}
@@ -206,7 +281,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
                   type="button"
                   onClick={handleStartUpload}
                   disabled={!selectedFile}
-                  className="px-5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-40 rounded-xl shadow-sm transition-colors"
+                  className="px-5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-40 rounded-xl shadow-xs transition-colors"
                 >
                   Start Processing
                 </button>
@@ -214,73 +289,82 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
             </>
           )}
 
-          {/* Processing Stages */}
-          {(stage === 'uploading' || stage === 'extracting' || stage === 'indexing') && (
-            <div className="py-6 space-y-4">
-              <div className="text-center mb-6">
+          {/* 2. Live Polling Processing Card with Stepper */}
+          {isProcessing && (
+            <div className="py-4 space-y-5">
+              <div className="text-center">
                 <Loader2 className="w-8 h-8 animate-spin text-blue-600 mx-auto mb-2" />
-                <h3 className="text-xs font-bold text-slate-800">Processing Contract Pipeline</h3>
-                <p className="text-[11px] text-slate-400">{selectedFile?.name}</p>
+                <h3 className="text-xs font-bold text-slate-800">Processing Contract</h3>
+                <p className="text-[11px] text-slate-400 truncate max-w-xs mx-auto">
+                  {selectedFile?.name}
+                </p>
               </div>
 
-              <div className="space-y-3 max-w-xs mx-auto text-xs">
-                {/* Step 1 */}
-                <div className="flex items-center gap-3">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  <span className="text-slate-800 font-medium">File uploaded</span>
-                </div>
-
-                {/* Step 2 */}
-                <div className="flex items-center gap-3">
-                  {stage === 'uploading' ? (
-                    <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-                  ) : (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  )}
-                  <span className={stage === 'uploading' ? 'text-blue-600 font-medium' : 'text-slate-800 font-medium'}>
-                    Extracting text & page maps
-                  </span>
-                </div>
-
-                {/* Step 3 */}
-                <div className="flex items-center gap-3">
-                  {stage === 'indexing' ? (
-                    <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-                  ) : (
-                    <span className="w-4 h-4 rounded-full border border-slate-300 inline-block" />
-                  )}
-                  <span className={stage === 'indexing' ? 'text-blue-600 font-medium' : 'text-slate-400'}>
-                    Building searchable legal index
-                  </span>
-                </div>
-
-                {/* Step 4 */}
-                <div className="flex items-center gap-3">
-                  <span className="w-4 h-4 rounded-full border border-slate-300 inline-block" />
-                  <span className="text-slate-400">Finalizing</span>
-                </div>
+              {/* Progress bar */}
+              <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden border border-slate-200">
+                <div
+                  className="bg-blue-600 h-2 rounded-full transition-all duration-500"
+                  style={{ width: `${progressPercent}%` }}
+                />
               </div>
+
+              {/* Stepper */}
+              <div className="space-y-2.5 max-w-xs mx-auto text-xs">
+                {STAGES.slice(0, 4).map((stageName, idx) => {
+                  const currentIdx = getStageIndex(currentStage);
+                  const isDone = currentIdx > idx;
+                  const isCurrent = currentIdx === idx;
+
+                  return (
+                    <div key={stageName} className="flex items-center gap-3">
+                      {isDone ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      ) : isCurrent ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-blue-600 shrink-0" />
+                      ) : (
+                        <span className="w-4 h-4 rounded-full border border-slate-300 inline-block shrink-0" />
+                      )}
+                      <span
+                        className={`font-medium ${
+                          isDone
+                            ? 'text-slate-800'
+                            : isCurrent
+                            ? 'text-blue-600 font-semibold'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        {stageName}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <p className="text-[10px] text-center text-slate-400">
+                Extracting canonical text, indexing clauses, and verifying readability...
+              </p>
             </div>
           )}
 
-          {/* Ready Stage */}
-          {stage === 'ready' && resultDoc && (
-            <div className="py-6 text-center space-y-4">
+          {/* 3. Ready Stage */}
+          {readyDoc && !isFailed && (
+            <div className="py-4 text-center space-y-4">
               <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto mb-2">
                 <CheckCircle2 className="w-6 h-6" />
               </div>
               <h3 className="text-sm font-bold text-slate-900">Contract Ready for Analysis</h3>
-              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs inline-block text-slate-700">
-                <p className="font-semibold text-slate-900 mb-1">{resultDoc.originalFilename}</p>
-                <p className="text-slate-500">
-                  ✓ Ready &nbsp;·&nbsp; {resultDoc.pageCount} pages &nbsp;·&nbsp; {resultDoc.chunksCount || 'multiple'} searchable passages
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs inline-block text-slate-700 max-w-xs">
+                <p className="font-semibold text-slate-900 mb-1 truncate">{readyDoc.originalFilename}</p>
+                <p className="text-slate-500 text-[11px]">
+                  {readyDoc.pageCount} page{readyDoc.pageCount === 1 ? '' : 's'} · Verified canonical text
                 </p>
               </div>
 
               <div>
                 <button
+                  type="button"
                   onClick={onClose}
-                  className="px-6 py-2 rounded-xl text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 shadow-sm"
+                  className="px-6 py-2 rounded-xl text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 shadow-xs"
                 >
                   Open in Analyzer
                 </button>
@@ -288,33 +372,34 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
             </div>
           )}
 
-          {/* Failed Stage (Scanned PDF or format error) */}
-          {stage === 'failed' && (
-            <div className="py-6 text-center space-y-4">
+          {/* 4. Failed Stage (Scanned PDF or format error) */}
+          {isFailed && (
+            <div className="py-4 text-center space-y-4">
               <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mx-auto mb-2">
                 <AlertCircle className="w-6 h-6" />
               </div>
               <h3 className="text-sm font-bold text-slate-900">Processing Failed</h3>
-              <p className="text-xs text-rose-700 bg-rose-50 p-3 rounded-xl border border-rose-200 leading-relaxed max-w-sm mx-auto">
-                {errorMessage || 'Unable to process this document.'}
-              </p>
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 leading-relaxed max-w-sm mx-auto text-left">
+                <p className="font-semibold mb-1">Unable to extract readable text:</p>
+                <p className="text-[11px] text-rose-700">{failureReason}</p>
+              </div>
 
               <div className="flex justify-center gap-2 pt-2">
                 <button
-                  onClick={() => {
-                    setStage('idle');
-                    setSelectedFile(null);
-                    setErrorMessage(null);
-                  }}
-                  className="px-4 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50 rounded-xl"
+                  type="button"
+                  onClick={handleDeleteFailed}
+                  className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-xl"
                 >
-                  Try Another File
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Delete & Reset</span>
                 </button>
                 <button
-                  onClick={onClose}
-                  className="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-xl"
+                  type="button"
+                  onClick={handleReset}
+                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl"
                 >
-                  Close
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Upload Another</span>
                 </button>
               </div>
             </div>

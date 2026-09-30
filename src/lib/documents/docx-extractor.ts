@@ -9,21 +9,29 @@ import { detectSections } from './pdf-extractor';
 
 const execAsync = promisify(exec);
 
+export async function renderDocxToHtml(docxBuffer: Buffer): Promise<string> {
+  const { value: html } = await mammoth.convertToHtml({ buffer: docxBuffer });
+  return html;
+}
+
 /**
  * Extracts canonical text from a DOCX buffer and converts it to a rendered PDF.
+ * Canonical text and viewer HTML share paragraph boundaries so offsets map accurately.
  */
 export async function extractDocxTextAndRenderPdf(
   docxBuffer: Buffer,
   documentId: string,
   storageRenderedDir: string
-): Promise<ExtractedDocument & { renderedPdfPath: string; isScannedOrEmpty: boolean }> {
-  // Extract raw text with paragraph preservation
+): Promise<ExtractedDocument & { renderedPdfPath: string; renderedPdfBuffer?: Buffer; isScannedOrEmpty: boolean; html: string }> {
+  // Extract raw text and HTML representation
   const { value: rawText } = await mammoth.extractRawText({ buffer: docxBuffer });
+  const { value: html } = await mammoth.convertToHtml({ buffer: docxBuffer });
+
   const trimmed = rawText.trim();
+  const nonWhitespaceCount = trimmed.replace(/\s+/g, '').length;
+  const isScannedOrEmpty = nonWhitespaceCount < 25;
 
-  const isScannedOrEmpty = trimmed.replace(/\s+/g, '').length < 15;
-
-  // Split into rough page estimates (~3000 chars per page if single docx)
+  // Split into pages with ~2500 characters per page
   const pageSizeChars = 2500;
   const pages: ExtractedPage[] = [];
   const lines = trimmed.split('\n');
@@ -43,7 +51,7 @@ export async function extractDocxTextAndRenderPdf(
         startOffset: pageStart,
         endOffset: pageEnd,
       });
-      overallOffset = pageEnd + 2; // account for \n\n
+      overallOffset = pageEnd + 2;
       currentAccumulated = line + '\n';
     } else {
       currentAccumulated += line + '\n';
@@ -70,28 +78,32 @@ export async function extractDocxTextAndRenderPdf(
     });
   }
 
-  // Ensure rendered storage directory exists
   await fs.mkdir(storageRenderedDir, { recursive: true });
   const renderedPdfFilename = `${documentId}.pdf`;
   const renderedPdfPath = path.join(storageRenderedDir, renderedPdfFilename);
 
-  // Render to PDF: Check if LibreOffice is available, else render clean PDF with pdf-lib
+  let renderedPdfBuffer: Buffer | undefined;
+
+  // Check if LibreOffice is available, else render clean multi-page PDF using pdf-lib
   let renderedWithLibreOffice = false;
   try {
     const tempDocxPath = path.join(storageRenderedDir, `${documentId}_temp.docx`);
     await fs.writeFile(tempDocxPath, docxBuffer);
-    await execAsync(`soffice --headless --convert-to pdf "${tempDocxPath}" --outdir "${storageRenderedDir}"`, { timeout: 10000 });
+    await execAsync(`soffice --headless --convert-to pdf "${tempDocxPath}" --outdir "${storageRenderedDir}"`, {
+      timeout: 10000,
+    });
     const convertedPath = path.join(storageRenderedDir, `${documentId}_temp.pdf`);
     await fs.rename(convertedPath, renderedPdfPath);
     await fs.unlink(tempDocxPath).catch(() => {});
     renderedWithLibreOffice = true;
+    renderedPdfBuffer = await fs.readFile(renderedPdfPath);
   } catch {
     renderedWithLibreOffice = false;
   }
 
   if (!renderedWithLibreOffice) {
-    // Generate high fidelity PDF using pdf-lib with text layers
-    await renderTextToPdf(pages, renderedPdfPath);
+    // Generate high fidelity PDF with pdf-lib without dropping overflow text
+    renderedPdfBuffer = await renderTextToPdf(pages, renderedPdfPath);
   }
 
   const sections = detectSections(trimmed, pages);
@@ -102,14 +114,17 @@ export async function extractDocxTextAndRenderPdf(
     pages,
     sections,
     renderedPdfPath,
+    renderedPdfBuffer,
     isScannedOrEmpty,
+    html,
   };
 }
 
 /**
  * Creates a formatted PDF with text layer from extracted pages using pdf-lib.
+ * Overflow text generates a new page instead of dropping lines.
  */
-async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Promise<void> {
+async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Promise<Buffer> {
   const pdfDoc = await PDFDocument.create();
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
@@ -121,18 +136,23 @@ async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Prom
   const fontSize = 10;
   const maxLineWidth = pageWidth - margin * 2;
 
+  let pageIndex = 1;
+
   for (const pageInfo of pages) {
-    const page = pdfDoc.addPage([pageWidth, pageHeight]);
+    let currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
     let y = pageHeight - margin;
 
-    // Header
-    page.drawText(`Page ${pageInfo.pageNumber}`, {
-      x: pageWidth - margin - 50,
-      y: pageHeight - margin + 20,
-      size: 9,
-      font,
-      color: rgb(0.5, 0.5, 0.5),
-    });
+    const drawHeader = (p: typeof currentPage, pNum: number) => {
+      p.drawText(`Page ${pNum}`, {
+        x: pageWidth - margin - 50,
+        y: pageHeight - margin + 20,
+        size: 9,
+        font,
+        color: rgb(0.5, 0.5, 0.5),
+      });
+    };
+
+    drawHeader(currentPage, pageIndex++);
 
     const lines = pageInfo.text.split('\n');
 
@@ -140,16 +160,18 @@ async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Prom
       const line = rawLine.trim();
       if (!line) {
         y -= lineHeight * 0.75;
-        if (y < margin) break;
+        if (y < margin) {
+          currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
+          drawHeader(currentPage, pageIndex++);
+          y = pageHeight - margin;
+        }
         continue;
       }
 
-      // Check if line looks like a legal heading
       const isHeader = /^(?:SECTION|Section|CLAUSE|Clause|ARTICLE|Article|[0-9]{1,2}\.)/.test(line);
       const activeFont = isHeader ? boldFont : font;
       const activeSize = isHeader ? fontSize + 1 : fontSize;
 
-      // Simple word wrapping
       const words = line.split(' ');
       let currentLine = '';
 
@@ -158,7 +180,13 @@ async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Prom
         const testWidth = activeFont.widthOfTextAtSize(testLine, activeSize);
 
         if (testWidth > maxLineWidth && currentLine.length > 0) {
-          page.drawText(currentLine, {
+          if (y < margin + lineHeight) {
+            currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
+            drawHeader(currentPage, pageIndex++);
+            y = pageHeight - margin;
+          }
+
+          currentPage.drawText(currentLine, {
             x: margin,
             y,
             size: activeSize,
@@ -167,14 +195,19 @@ async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Prom
           });
           y -= lineHeight;
           currentLine = word;
-          if (y < margin) break;
         } else {
           currentLine = testLine;
         }
       }
 
-      if (currentLine.length > 0 && y >= margin) {
-        page.drawText(currentLine, {
+      if (currentLine.length > 0) {
+        if (y < margin + lineHeight) {
+          currentPage = pdfDoc.addPage([pageWidth, pageHeight]);
+          drawHeader(currentPage, pageIndex++);
+          y = pageHeight - margin;
+        }
+
+        currentPage.drawText(currentLine, {
           x: margin,
           y,
           size: activeSize,
@@ -183,13 +216,10 @@ async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Prom
         });
         y -= lineHeight;
       }
-
-      if (y < margin) {
-        break;
-      }
     }
   }
 
   const pdfBytes = await pdfDoc.save();
   await fs.writeFile(outputPath, pdfBytes);
+  return Buffer.from(pdfBytes);
 }

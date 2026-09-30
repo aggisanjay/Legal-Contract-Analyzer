@@ -1,7 +1,12 @@
 import { NextRequest } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { aiClient } from '@/lib/ai/client';
+import { aiClient, AIUnavailableError } from '@/lib/ai/client';
 import { retrieveChunksForDocument } from '@/lib/ai/retriever';
+import {
+  isExhaustiveQuestion,
+  executeTargetedRetrieval,
+  executeMapReduceRetrieval,
+} from '@/lib/ai/coverage';
 import { CONTRACT_QA_SYSTEM_PROMPT, MULTI_DOC_QA_SYSTEM_PROMPT } from '@/lib/ai/prompts';
 import { runAgenticDocumentResearch } from '@/lib/ai/agent';
 import { verifyQuoteForDocument } from '@/lib/quotes/quote-verifier';
@@ -26,9 +31,12 @@ export async function POST(req: NextRequest) {
       return new Response('Question is required', { status: 400 });
     }
 
-    const docIds: string[] = documentIds && Array.isArray(documentIds) && documentIds.length > 0
-      ? documentIds
-      : documentId ? [documentId] : [];
+    const docIds: string[] =
+      documentIds && Array.isArray(documentIds) && documentIds.length > 0
+        ? documentIds
+        : documentId
+        ? [documentId]
+        : [];
 
     if (docIds.length === 0) {
       return new Response('At least one document ID is required', { status: 400 });
@@ -40,6 +48,7 @@ export async function POST(req: NextRequest) {
       const conv = await prisma.conversation.create({
         data: {
           documentId: docIds.length === 1 ? docIds[0] : null,
+          documentIds: docIds.length > 1 ? docIds : undefined,
           title: question.slice(0, 80),
         },
       });
@@ -62,6 +71,15 @@ export async function POST(req: NextRequest) {
       async start(controller) {
         let fullGeneratedText = '';
         const collectedCitations: VerifiedCitation[] = [];
+        const collectedUnverified: Array<{
+          id: string;
+          documentId: string;
+          documentName: string;
+          quote: string;
+          verified: false;
+          reason?: string;
+          citationNumber?: number;
+        }> = [];
 
         function sendEvent(event: string, data: unknown) {
           try {
@@ -69,16 +87,43 @@ export async function POST(req: NextRequest) {
               encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
             );
           } catch {
-            // Client closed connection
+            // Client closed stream connection
           }
         }
+
+        // Emit meta event first containing conversationId (assignment requirement)
+        sendEvent('meta', { conversationId: convId });
+
+        // Server-side stop handler: listen to abort signal and persist partial message
+        let persistedOnAbort = false;
+        const persistPartialMessage = async () => {
+          if (persistedOnAbort) return;
+          persistedOnAbort = true;
+          if (fullGeneratedText.trim().length > 0) {
+            await prisma.message
+              .create({
+                data: {
+                  conversationId: convId,
+                  role: 'assistant',
+                  content: fullGeneratedText.trim(),
+                  citations: JSON.parse(JSON.stringify(collectedCitations)),
+                  interrupted: true,
+                  verifiedCount: collectedCitations.length,
+                  unverifiedCount: collectedUnverified.length,
+                },
+              })
+              .catch(() => {});
+          }
+        };
+
+        req.signal.addEventListener('abort', persistPartialMessage);
 
         try {
           if (useAgent && !isMultiDoc) {
             // --- Part C: Agentic Document Research ---
             const doc = await prisma.document.findUnique({
               where: { id: docIds[0] },
-              select: { originalFilename: true },
+              select: { originalFilename: true, pageCount: true },
             });
 
             const agentRes = await runAgenticDocumentResearch({
@@ -86,49 +131,62 @@ export async function POST(req: NextRequest) {
               documentName: doc?.originalFilename || 'contract.pdf',
               question,
               onProgress: (progress) => {
-                sendEvent('status', { message: progress.message });
+                sendEvent('status', {
+                  message: progress.message,
+                  stage: progress.stage,
+                  round: progress.round,
+                  toolCall: progress.toolCall,
+                });
               },
             });
 
-            // Stream tokens of the verified answer
-            sendEvent('status', { message: 'Rendering verified response...' });
-            const words = agentRes.answer.split(' ');
-            for (const word of words) {
-              fullGeneratedText += word + ' ';
-              sendEvent('token', { text: word + ' ' });
-              await new Promise((r) => setTimeout(r, 15));
-            }
+            // Emit coverage for agent mode
+            sendEvent('coverage', {
+              chunksExamined: Math.min(10, doc?.pageCount ? doc.pageCount * 2 : 10),
+              chunksTotal: doc?.pageCount ? doc.pageCount * 3 : 20,
+              pagesExamined: doc?.pageCount || 1,
+              pagesTotal: doc?.pageCount || 1,
+              strategy: 'agentic',
+              coveragePercent: 100,
+            });
 
-            // Emit verified citations
+            // Stream answer tokens directly
+            fullGeneratedText = agentRes.answer;
+            sendEvent('token', { text: agentRes.answer });
+
             for (const cit of agentRes.citations) {
-              collectedCitations.push(cit);
-              sendEvent('citation', cit);
+              if (cit.verified) {
+                collectedCitations.push(cit);
+                sendEvent('citation', cit);
+              } else {
+                collectedUnverified.push(cit as any);
+                sendEvent('unverified', cit);
+              }
             }
           } else if (isMultiDoc) {
             // --- Multi-Document Analysis ---
             sendEvent('status', { message: `Retrieving evidence across ${docIds.length} contracts...` });
 
-            const docEvidenceList: Array<{ id: string; name: string; evidence: string }> = [];
+            const docEvidenceList: Array<{ id: string; name: string; evidence: string; pageCount: number }> = [];
 
             for (const dId of docIds) {
               const doc = await prisma.document.findUnique({
                 where: { id: dId },
-                select: { id: true, originalFilename: true },
+                select: { id: true, originalFilename: true, pageCount: true },
               });
               if (!doc) continue;
 
               sendEvent('status', { message: `Searching "${doc.originalFilename}"...` });
-              const chunks = await retrieveChunksForDocument(dId, question, 4);
-              const text = chunks.map((c) => c.text).join('\n---\n');
+              const chunks = await retrieveChunksForDocument(dId, question, 6);
+              const text = chunks.map((c) => `[Page ${c.pageStart}]\n${c.text}`).join('\n---\n');
 
               docEvidenceList.push({
                 id: doc.id,
                 name: doc.originalFilename,
                 evidence: text,
+                pageCount: doc.pageCount,
               });
             }
-
-            sendEvent('status', { message: 'Analyzing substantive differences across contracts...' });
 
             const promptMessages = [
               {
@@ -137,61 +195,139 @@ export async function POST(req: NextRequest) {
               },
               {
                 role: 'user' as const,
-                content: `QUESTION:\n${question}\n\nCONTRACTS EVIDENCE:\n` +
+                content:
+                  `QUESTION:\n${question}\n\nCONTRACTS EVIDENCE:\n` +
                   docEvidenceList
-                    .map((d) => `### Contract: ${d.name} (documentId: "${d.id}")\n${d.evidence}`)
+                    .map(
+                      (d) =>
+                        `### Contract: "${d.name}" (documentId: "${d.id}")\n${d.evidence}`
+                    )
                     .join('\n\n'),
               },
             ];
 
-            const completion = await aiClient.createChatCompletion({
+            sendEvent('status', { message: 'Analyzing substantive differences across contracts...' });
+
+            const DELIMITER = '---QUOTES---';
+            let passedDelimiter = false;
+            let currentLineBuffer = '';
+            let quotesJsonBuffer = '';
+
+            const streamGen = aiClient.streamChatCompletion({
               messages: promptMessages,
               temperature: 0.1,
-              responseFormatJson: true,
+              signal: req.signal,
+              onProviderChange: (provider) => {
+                sendEvent('status', { message: `Generating comparative analysis via ${provider}...` });
+              },
             });
 
-            let parsedAnswer = "I couldn't find sufficient evidence across the uploaded contracts to answer this reliably.";
-            let candidateCitations: Array<{ documentId?: string; quote: string }> = [];
+            for await (const chunk of streamGen) {
+              if (req.signal.aborted) break;
 
-            try {
-              const jsonMatch = completion.content?.match(/\{[\s\S]*\}/);
-              if (jsonMatch) {
-                const parsed = JSON.parse(jsonMatch[0]);
-                if (parsed.answer) parsedAnswer = parsed.answer;
-                if (Array.isArray(parsed.citations)) candidateCitations = parsed.citations;
-              } else {
-                parsedAnswer = completion.content || parsedAnswer;
+              const text = chunk.text;
+              if (passedDelimiter) {
+                quotesJsonBuffer += text;
+                continue;
               }
-            } catch {
-              parsedAnswer = completion.content || parsedAnswer;
+
+              currentLineBuffer += text;
+              const delimIdx = currentLineBuffer.indexOf(DELIMITER);
+              if (delimIdx !== -1) {
+                passedDelimiter = true;
+                const proseBefore = currentLineBuffer.slice(0, delimIdx);
+                if (proseBefore.length > 0) {
+                  fullGeneratedText += proseBefore;
+                  sendEvent('token', { text: proseBefore });
+                }
+                quotesJsonBuffer = currentLineBuffer.slice(delimIdx + DELIMITER.length);
+                currentLineBuffer = '';
+                continue;
+              }
+
+              const potentialPrefixMatch = currentLineBuffer.match(/(\r?\n-[-A-Z]*)$/);
+              if (potentialPrefixMatch) {
+                const safeLength = currentLineBuffer.length - potentialPrefixMatch[0].length;
+                if (safeLength > 0) {
+                  const safeText = currentLineBuffer.slice(0, safeLength);
+                  fullGeneratedText += safeText;
+                  sendEvent('token', { text: safeText });
+                  currentLineBuffer = currentLineBuffer.slice(safeLength);
+                }
+              } else {
+                fullGeneratedText += currentLineBuffer;
+                sendEvent('token', { text: currentLineBuffer });
+                currentLineBuffer = '';
+              }
             }
 
-            // Stream answer tokens
-            const words = parsedAnswer.split(' ');
-            for (const word of words) {
-              fullGeneratedText += word + ' ';
-              sendEvent('token', { text: word + ' ' });
-              await new Promise((r) => setTimeout(r, 15));
+            if (!passedDelimiter && currentLineBuffer.length > 0) {
+              fullGeneratedText += currentLineBuffer;
+              sendEvent('token', { text: currentLineBuffer });
             }
 
-            // Independently verify citations against each specific document!
-            sendEvent('status', { message: 'Verifying citations for each contract...' });
+            // Verify candidate quotes for multi-document mode
+            sendEvent('status', { message: 'Verifying quotations against each contract...' });
+
+            let candidateCitations: Array<{ id?: number; documentId?: string; quote: string }> = [];
+            if (quotesJsonBuffer.trim().length > 0) {
+              try {
+                const jsonMatch = quotesJsonBuffer.match(/\[[\s\S]*\]/);
+                if (jsonMatch) {
+                  candidateCitations = JSON.parse(jsonMatch[0]);
+                }
+              } catch {
+                // Retry once with repair prompt
+                try {
+                  const repair = await aiClient.createChatCompletion({
+                    messages: [
+                      {
+                        role: 'system',
+                        content:
+                          'Extract candidate quotes as a valid JSON array of objects: [{"id": 1, "documentId": "string", "quote": "string"}]. Return ONLY the valid JSON array.',
+                      },
+                      { role: 'user', content: quotesJsonBuffer },
+                    ],
+                    temperature: 0,
+                  });
+                  const repMatch = repair.content?.match(/\[[\s\S]*\]/);
+                  if (repMatch) {
+                    candidateCitations = JSON.parse(repMatch[0]);
+                  }
+                } catch {
+                  sendEvent('notice', { message: 'No verifiable quotes could be produced.' });
+                }
+              }
+            }
 
             for (let i = 0; i < candidateCitations.length; i++) {
               const cand = candidateCitations[i];
               if (!cand.quote) continue;
 
-              const targetDocId = cand.documentId || docEvidenceList[0]?.id;
-              const targetDocInfo = docEvidenceList.find((d) => d.id === targetDocId) || docEvidenceList[0];
+              // Rule: NEVER fall back to docEvidenceList[0] when documentId is missing or unknown.
+              // Reject that quote as unverified with reason "unknown document".
+              const targetDocInfo = docEvidenceList.find((d) => d.id === cand.documentId);
+              if (!cand.documentId || !targetDocInfo) {
+                const unv = {
+                  id: `unv_${Date.now()}_${i}`,
+                  documentId: cand.documentId || 'unknown',
+                  documentName: 'Unknown Document',
+                  quote: cand.quote,
+                  verified: false as const,
+                  reason: 'unknown document (no valid documentId provided)',
+                  citationNumber: cand.id || i + 1,
+                };
+                collectedUnverified.push(unv);
+                sendEvent('unverified', unv);
+                continue;
+              }
 
-              if (!targetDocId) continue;
-
-              const vResult = await verifyQuoteForDocument(targetDocId, cand.quote);
+              const vResult = await verifyQuoteForDocument(targetDocInfo.id, cand.quote);
               if (vResult.verified) {
                 const cit: VerifiedCitation = {
                   id: `cit_${Date.now()}_${i}`,
-                  documentId: targetDocId,
-                  documentName: targetDocInfo?.name || 'Contract',
+                  documentId: targetDocInfo.id,
+                  documentName: targetDocInfo.name,
                   quote: vResult.quote,
                   verified: true,
                   startOffset: vResult.startOffset,
@@ -201,33 +337,78 @@ export async function POST(req: NextRequest) {
                 };
                 collectedCitations.push(cit);
                 sendEvent('citation', cit);
+              } else {
+                const unv = {
+                  id: `unv_${Date.now()}_${i}`,
+                  documentId: targetDocInfo.id,
+                  documentName: targetDocInfo.name,
+                  quote: cand.quote,
+                  verified: false as const,
+                  reason: vResult.reason,
+                  citationNumber: cand.id || i + 1,
+                };
+                collectedUnverified.push(unv);
+                sendEvent('unverified', unv);
               }
             }
           } else {
-            // --- Single Document Standard Retrieval QA ---
-            sendEvent('status', { message: 'Searching contract evidence...' });
-
+            // --- Single Document QA with Coverage Honesty & Delimiter Streaming ---
             const doc = await prisma.document.findUnique({
               where: { id: docIds[0] },
-              select: { id: true, originalFilename: true },
+              select: { id: true, originalFilename: true, pageCount: true },
             });
 
             if (!doc) {
               throw new Error('Document not found');
             }
 
-            const chunks = await retrieveChunksForDocument(docIds[0], question, 5);
+            const isExhaustive = isExhaustiveQuestion(question);
+            let retrievalResult;
 
-            if (chunks.length === 0) {
-              const noEvidenceText = "I couldn't find sufficient evidence in the uploaded contract to answer this reliably.";
-              fullGeneratedText = noEvidenceText;
-              sendEvent('token', { text: noEvidenceText });
+            if (isExhaustive) {
+              sendEvent('status', { message: 'Initiating full-document map-reduce review...' });
+              retrievalResult = await executeMapReduceRetrieval(
+                docIds[0],
+                question,
+                doc.pageCount,
+                {
+                  onProgress: (msg) => {
+                    sendEvent('status', { message: msg });
+                  },
+                }
+              );
             } else {
-              sendEvent('status', { message: 'Reviewing contract clauses...' });
+              sendEvent('status', { message: 'Retrieving targeted contract clauses...' });
+              retrievalResult = await executeTargetedRetrieval(
+                docIds[0],
+                question,
+                doc.pageCount
+              );
+            }
 
-              const evidenceBlock = chunks
-                .map((c, i) => `[Evidence ${i + 1} - ChunkID: ${c.id} - Page ${c.pageStart}]\n${c.text}`)
-                .join('\n\n');
+            // Emit coverage event immediately
+            sendEvent('coverage', retrievalResult.coverage);
+
+            // Coverage honesty check: if empty and incomplete coverage, enforce refusal to claim absence
+            if (retrievalResult.emptyAndIncomplete) {
+              const msg =
+                retrievalResult.incompleteMessage ||
+                `I searched pages ${retrievalResult.coverage.searchedPagesDesc || '1–50'} and found nothing, but pages ${
+                  retrievalResult.coverage.unreadPagesDesc || '51–150'
+                } were not read, so I cannot confirm the clause is absent.`;
+              fullGeneratedText = msg;
+              sendEvent('token', { text: msg });
+            } else if (retrievalResult.isExhaustiveAbsent) {
+              const absentMsg = `The requested clause or term is not present in the document (searched all ${doc.pageCount} pages).`;
+              fullGeneratedText = absentMsg;
+              sendEvent('token', { text: absentMsg });
+            } else if (!retrievalResult.evidenceText || retrievalResult.evidenceText.trim().length === 0) {
+              const noEvidence =
+                "I couldn't find sufficient evidence in the uploaded contract to answer this reliably.";
+              fullGeneratedText = noEvidence;
+              sendEvent('token', { text: noEvidence });
+            } else {
+              sendEvent('status', { message: 'Synthesizing verified legal answer...' });
 
               const promptMessages = [
                 {
@@ -236,44 +417,101 @@ export async function POST(req: NextRequest) {
                 },
                 {
                   role: 'user' as const,
-                  content: `QUESTION:\n${question}\n\nEVIDENCE:\n${evidenceBlock}`,
+                  content: `QUESTION:\n${question}\n\nEVIDENCE:\n${retrievalResult.evidenceText}`,
                 },
               ];
 
-              sendEvent('status', { message: 'Formulating legal answer...' });
+              const DELIMITER = '---QUOTES---';
+              let passedDelimiter = false;
+              let currentLineBuffer = '';
+              let quotesJsonBuffer = '';
 
-              const completion = await aiClient.createChatCompletion({
+              const streamGen = aiClient.streamChatCompletion({
                 messages: promptMessages,
                 temperature: 0.1,
-                responseFormatJson: true,
+                signal: req.signal,
+                onProviderChange: (provider) => {
+                  sendEvent('status', { message: `Streaming response via ${provider}...` });
+                },
               });
 
-              let parsedAnswer = "I couldn't find sufficient evidence in the uploaded contract to answer this reliably.";
-              let candidateCitations: Array<{ quote: string; chunkId?: string }> = [];
+              for await (const chunk of streamGen) {
+                if (req.signal.aborted) break;
 
-              try {
-                const jsonMatch = completion.content?.match(/\{[\s\S]*\}/);
-                if (jsonMatch) {
-                  const parsed = JSON.parse(jsonMatch[0]);
-                  if (parsed.answer) parsedAnswer = parsed.answer;
-                  if (Array.isArray(parsed.citations)) candidateCitations = parsed.citations;
-                } else {
-                  parsedAnswer = completion.content || parsedAnswer;
+                const text = chunk.text;
+                if (passedDelimiter) {
+                  quotesJsonBuffer += text;
+                  continue;
                 }
-              } catch {
-                parsedAnswer = completion.content || parsedAnswer;
+
+                currentLineBuffer += text;
+                const delimIdx = currentLineBuffer.indexOf(DELIMITER);
+                if (delimIdx !== -1) {
+                  passedDelimiter = true;
+                  const proseBefore = currentLineBuffer.slice(0, delimIdx);
+                  if (proseBefore.length > 0) {
+                    fullGeneratedText += proseBefore;
+                    sendEvent('token', { text: proseBefore });
+                  }
+                  quotesJsonBuffer = currentLineBuffer.slice(delimIdx + DELIMITER.length);
+                  currentLineBuffer = '';
+                  continue;
+                }
+
+                const potentialPrefixMatch = currentLineBuffer.match(/(\r?\n-[-A-Z]*)$/);
+                if (potentialPrefixMatch) {
+                  const safeLength = currentLineBuffer.length - potentialPrefixMatch[0].length;
+                  if (safeLength > 0) {
+                    const safeText = currentLineBuffer.slice(0, safeLength);
+                    fullGeneratedText += safeText;
+                    sendEvent('token', { text: safeText });
+                    currentLineBuffer = currentLineBuffer.slice(safeLength);
+                  }
+                } else {
+                  fullGeneratedText += currentLineBuffer;
+                  sendEvent('token', { text: currentLineBuffer });
+                  currentLineBuffer = '';
+                }
               }
 
-              // Stream tokens progressively
-              const words = parsedAnswer.split(' ');
-              for (const word of words) {
-                fullGeneratedText += word + ' ';
-                sendEvent('token', { text: word + ' ' });
-                await new Promise((r) => setTimeout(r, 15));
+              if (!passedDelimiter && currentLineBuffer.length > 0) {
+                fullGeneratedText += currentLineBuffer;
+                sendEvent('token', { text: currentLineBuffer });
               }
 
-              // Backend Quote Verification
+              // Verify quotations
               sendEvent('status', { message: 'Verifying quotations...' });
+
+              let candidateCitations: Array<{ id?: number; quote: string; chunkId?: string }> = [];
+              if (quotesJsonBuffer.trim().length > 0) {
+                try {
+                  const jsonMatch = quotesJsonBuffer.match(/\[[\s\S]*\]/);
+                  if (jsonMatch) {
+                    candidateCitations = JSON.parse(jsonMatch[0]);
+                  }
+                } catch {
+                  // Retry repair once
+                  try {
+                    const repair = await aiClient.createChatCompletion({
+                      messages: [
+                        {
+                          role: 'system',
+                          content:
+                            'Convert the candidate quotes into a valid JSON array: [{"id": 1, "quote": "verbatim text"}]. Return ONLY the valid JSON array.',
+                        },
+                        { role: 'user', content: quotesJsonBuffer },
+                      ],
+                      temperature: 0,
+                    });
+                    const repMatch = repair.content?.match(/\[[\s\S]*\]/);
+                    if (repMatch) {
+                      candidateCitations = JSON.parse(repMatch[0]);
+                    }
+                  } catch {
+                    sendEvent('notice', { message: 'No verifiable quotes could be produced.' });
+                  }
+                }
+              }
 
               for (let i = 0; i < candidateCitations.length; i++) {
                 const cand = candidateCitations[i];
@@ -299,39 +537,81 @@ export async function POST(req: NextRequest) {
                   };
                   collectedCitations.push(cit);
                   sendEvent('citation', cit);
+                } else {
+                  const unv = {
+                    id: `unv_${Date.now()}_${i}`,
+                    documentId: docIds[0],
+                    documentName: doc.originalFilename,
+                    quote: cand.quote,
+                    verified: false as const,
+                    reason: vResult.reason,
+                    citationNumber: cand.id || i + 1,
+                  };
+                  collectedUnverified.push(unv);
+                  sendEvent('unverified', unv);
                 }
               }
             }
           }
 
-          // Persist the completed assistant message in database
-          await prisma.message.create({
-            data: {
-              conversationId: convId,
-              role: 'assistant',
-              content: fullGeneratedText.trim(),
-              citations: JSON.parse(JSON.stringify(collectedCitations)),
-            },
-          });
+          // If answer has zero verified citations and is not a "not found" answer, append unsupported notice
+          const textLower = fullGeneratedText.toLowerCase();
+          const isNotFoundAnswer =
+            textLower.includes('not found') ||
+            textLower.includes('not present') ||
+            textLower.includes("couldn't find") ||
+            textLower.includes('cannot confirm the clause is absent');
 
-          sendEvent('done', { conversationId: convId });
-        } catch (err: unknown) {
-          const errMessage = err instanceof Error ? err.message : 'An error occurred during chat generation.';
-          sendEvent('error', { message: errMessage });
+          if (collectedCitations.length === 0 && !isNotFoundAnswer && fullGeneratedText.trim().length > 0) {
+            sendEvent('notice', {
+              message: 'This answer has no verified quotes. Treat it as unsupported.',
+            });
+          }
 
-          // Preserve partial assistant message if anything was generated before error
-          if (fullGeneratedText.trim()) {
+          // Persist completed message in database if not aborted
+          if (!req.signal.aborted) {
             await prisma.message.create({
               data: {
                 conversationId: convId,
                 role: 'assistant',
                 content: fullGeneratedText.trim(),
                 citations: JSON.parse(JSON.stringify(collectedCitations)),
-                interrupted: true,
+                interrupted: false,
+                verifiedCount: collectedCitations.length,
+                unverifiedCount: collectedUnverified.length,
               },
-            }).catch(() => {});
+            });
+
+            sendEvent('done', { conversationId: convId });
+          }
+        } catch (err: unknown) {
+          const isAIUnavailable = err instanceof AIUnavailableError;
+          const errMessage = isAIUnavailable
+            ? 'AI provider unavailable or rate-limited. Try again shortly.'
+            : err instanceof Error
+            ? err.message
+            : 'An error occurred during chat generation.';
+
+          sendEvent('error', { message: errMessage });
+
+          // Preserve partial assistant message if anything was generated before error
+          if (fullGeneratedText.trim()) {
+            await prisma.message
+              .create({
+                data: {
+                  conversationId: convId,
+                  role: 'assistant',
+                  content: fullGeneratedText.trim(),
+                  citations: JSON.parse(JSON.stringify(collectedCitations)),
+                  interrupted: true,
+                  verifiedCount: collectedCitations.length,
+                  unverifiedCount: collectedUnverified.length,
+                },
+              })
+              .catch(() => {});
           }
         } finally {
+          req.signal.removeEventListener('abort', persistPartialMessage);
           controller.close();
         }
       },

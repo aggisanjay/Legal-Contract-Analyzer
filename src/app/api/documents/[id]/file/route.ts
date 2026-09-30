@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs/promises';
 import { prisma } from '@/lib/prisma';
+import { documentStorage } from '@/lib/documents/storage';
 
 export const dynamic = 'force-dynamic';
 
@@ -11,26 +11,37 @@ export async function GET(
   try {
     const doc = await prisma.document.findUnique({
       where: { id: params.id },
-      select: { originalFilePath: true, renderedPdfPath: true, mimeType: true, filename: true },
+      select: { filename: true, mimeType: true },
     });
 
     if (!doc) {
       return NextResponse.json({ error: 'Document not found' }, { status: 404 });
     }
 
-    const filePath = doc.renderedPdfPath || doc.originalFilePath;
-    try {
-      const fileBuffer = await fs.readFile(filePath);
-      return new NextResponse(fileBuffer, {
+    const fileBuffer = await documentStorage.getRenderedPdf(params.id);
+    if (fileBuffer) {
+      return new NextResponse(new Uint8Array(fileBuffer), {
         headers: {
           'Content-Type': 'application/pdf',
           'Content-Disposition': `inline; filename="${doc.filename}.pdf"`,
           'Cache-Control': 'public, max-age=3600',
         },
       });
-    } catch {
-      return NextResponse.json({ error: 'Physical document file not found on disk' }, { status: 404 });
     }
+
+    // Try original file if not converted
+    const origBuffer = await documentStorage.getOriginalFile(params.id);
+    if (origBuffer) {
+      return new NextResponse(new Uint8Array(origBuffer), {
+        headers: {
+          'Content-Type': doc.mimeType || 'application/octet-stream',
+          'Content-Disposition': `inline; filename="${doc.filename}"`,
+          'Cache-Control': 'public, max-age=3600',
+        },
+      });
+    }
+
+    return NextResponse.json({ error: 'Document file bytes not found' }, { status: 404 });
   } catch (err: unknown) {
     console.error('Failed to serve document file:', err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

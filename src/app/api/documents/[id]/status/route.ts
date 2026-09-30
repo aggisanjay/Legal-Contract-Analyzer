@@ -13,6 +13,7 @@ export async function GET(
       select: {
         id: true,
         status: true,
+        processingStage: true,
         statusMessage: true,
         pageCount: true,
         _count: {
@@ -25,9 +26,27 @@ export async function GET(
       return NextResponse.json({ error: 'Document not found' }, { status: 404 });
     }
 
+    const stage = doc.processingStage || (doc.status === 'READY' ? 'Ready' : 'Uploading');
+    let progress = 15;
+    if (doc.status === 'READY' || stage === 'Ready') {
+      progress = 100;
+    } else if (doc.status === 'FAILED') {
+      progress = 100;
+    } else if (stage === 'Indexing') {
+      progress = 85;
+    } else if (stage === 'Splitting into sections') {
+      progress = 70;
+    } else if (stage === 'Extracting text') {
+      progress = 40;
+    } else if (stage === 'Uploading') {
+      progress = 15;
+    }
+
     return NextResponse.json({
       status: doc.status,
-      statusMessage: doc.statusMessage,
+      stage,
+      progress,
+      message: doc.statusMessage || stage,
       pageCount: doc.pageCount,
       chunksCount: doc._count.chunks,
     });

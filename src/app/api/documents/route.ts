@@ -1,11 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server';
+import path from 'path';
 import { prisma } from '@/lib/prisma';
-import { processDocument, validateDocumentUpload } from '@/lib/documents/processor';
+import {
+  processDocumentInBackground,
+  validateDocumentUpload,
+} from '@/lib/documents/processor';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
   try {
+    // On library load, mark documents stuck in PROCESSING for > 10 minutes as FAILED
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+    await prisma.document.updateMany({
+      where: {
+        status: 'PROCESSING',
+        updatedAt: { lt: tenMinutesAgo },
+      },
+      data: {
+        status: 'FAILED',
+        statusMessage: 'Processing was interrupted. Please upload again.',
+      },
+    });
+
     const documents = await prisma.document.findMany({
       orderBy: { createdAt: 'desc' },
       include: {
@@ -22,6 +39,7 @@ export async function GET() {
       mimeType: doc.mimeType,
       size: doc.size,
       status: doc.status,
+      processingStage: doc.processingStage,
       statusMessage: doc.statusMessage,
       pageCount: doc.pageCount,
       originalFilePath: doc.originalFilePath,
@@ -54,30 +72,58 @@ export async function POST(req: NextRequest) {
     const mimeType = file.type || 'application/octet-stream';
     const size = file.size;
 
-    // Validate type and size
-    const validation = validateDocumentUpload(filename, mimeType, size);
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Validate type, size, and magic bytes
+    const validation = validateDocumentUpload(filename, mimeType, size, buffer);
     if (!validation.valid) {
       return NextResponse.json(
-        { error: validation.error || 'Unsupported file type. Please upload a PDF or DOCX contract.' },
+        { error: validation.error || 'Unsupported file type. Please upload a PDF or DOCX.' },
         { status: 400 }
       );
     }
 
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const ext = path.extname(filename).toLowerCase();
+    const safeBaseName = path.basename(filename, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const fileId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const storedFilename = `${safeBaseName}_${fileId}${ext}`;
 
-    // Process document
-    const result = await processDocument({
-      buffer,
-      originalFilename: filename,
-      mimeType,
-      size,
+    // Create initial document record with status PROCESSING and stage Uploading
+    const doc = await prisma.document.create({
+      data: {
+        filename: storedFilename,
+        originalFilename: filename,
+        mimeType,
+        size,
+        status: 'PROCESSING',
+        processingStage: 'Uploading',
+        statusMessage: 'Uploading file and preparing processing...',
+        originalFilePath: '',
+        fileData: buffer,
+      },
     });
 
-    return NextResponse.json({ document: result });
+    // Fire-and-forget background processing pipeline
+    // Next.js execution continues asynchronously
+    processDocumentInBackground(doc.id, buffer, filename, mimeType).catch((err) => {
+      console.error(`Background processing failed for ${doc.id}:`, err);
+    });
+
+    // Return immediately with { id, status: "PROCESSING" }
+    return NextResponse.json(
+      {
+        id: doc.id,
+        status: 'PROCESSING',
+        stage: 'Uploading',
+        progress: 15,
+        message: 'Uploading file and preparing processing...',
+      },
+      { status: 202 }
+    );
   } catch (err: unknown) {
-    console.error('Upload processing error:', err);
-    const msg = err instanceof Error ? err.message : 'Unable to process this document.';
+    console.error('Upload route error:', err);
+    const msg = err instanceof Error ? err.message : 'Unable to upload this document.';
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

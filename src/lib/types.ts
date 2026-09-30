@@ -8,6 +8,7 @@ export interface DocumentMetadata {
   size: number;
   status: DocumentStatus;
   statusMessage?: string | null;
+  processingStage?: string | null;
   pageCount: number;
   originalFilePath: string;
   renderedPdfPath?: string | null;
@@ -83,12 +84,33 @@ export type QuoteVerificationResult =
       reason: string;
     };
 
+export interface CoverageInfo {
+  chunksExamined: number;
+  chunksTotal: number;
+  pagesExamined: number;
+  pagesTotal: number;
+  strategy: string;
+  incomplete?: boolean;
+}
+
+export interface AgentTimelineStep {
+  round?: number;
+  tool?: string;
+  args?: Record<string, unknown>;
+  message: string;
+  stage?: string;
+}
+
 export interface ChatMessage {
   id: string;
   conversationId?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   citations?: VerifiedCitation[];
+  unverifiedCitations?: VerifiedCitation[];
+  notice?: string;
+  coverage?: CoverageInfo;
+  timeline?: AgentTimelineStep[];
   interrupted?: boolean;
   createdAt: string | Date;
 }
@@ -100,10 +122,16 @@ export interface ClauseDifference {
   sectionNumber?: string;
   title: string;
   significance: SignificanceLevel;
+  changeType?: 'added' | 'removed' | 'modified' | 'reworded';
   originalText: string;
   revisedText: string;
   substantiveChange: string;
   plainLanguageImpact: string;
+  numericOrDateChanges?: string;
+  diffSegments?: Array<{
+    type: 'equal' | 'insert' | 'delete';
+    text: string;
+  }>;
 }
 
 export interface ContractComparisonResult {

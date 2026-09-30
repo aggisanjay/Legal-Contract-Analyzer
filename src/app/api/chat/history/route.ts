@@ -7,72 +7,80 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const documentId = searchParams.get('documentId');
+    const conversationId = searchParams.get('conversationId');
 
-    if (!documentId) {
-      return NextResponse.json({ error: 'documentId is required' }, { status: 400 });
+    // Case 1: Load a specific conversation and all its messages with verified citations
+    if (conversationId) {
+      const conversation = await prisma.conversation.findUnique({
+        where: { id: conversationId },
+        include: {
+          messages: {
+            orderBy: { createdAt: 'asc' },
+          },
+        },
+      });
+
+      if (!conversation) {
+        return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
+      }
+
+      return NextResponse.json({
+        conversation: {
+          id: conversation.id,
+          title: conversation.title,
+          documentId: conversation.documentId,
+          documentIds: conversation.documentIds,
+          createdAt: conversation.createdAt,
+          updatedAt: conversation.updatedAt,
+        },
+        messages: conversation.messages.map((m) => ({
+          id: m.id,
+          conversationId: m.conversationId,
+          role: m.role,
+          content: m.content,
+          citations: m.citations,
+          interrupted: m.interrupted,
+          verifiedCount: m.verifiedCount,
+          unverifiedCount: m.unverifiedCount,
+          createdAt: m.createdAt,
+        })),
+      });
     }
 
-    const conversation = await prisma.conversation.findFirst({
-      where: { documentId },
+    // Case 2: List conversations for a document (including multi-doc ones that include it)
+    if (!documentId) {
+      return NextResponse.json({ error: 'documentId or conversationId is required' }, { status: 400 });
+    }
+
+    // Fetch conversations where documentId equals target, or multi-doc conversations that include it
+    const allConvs = await prisma.conversation.findMany({
       orderBy: { updatedAt: 'desc' },
       include: {
-        messages: {
-          orderBy: { createdAt: 'asc' },
+        _count: {
+          select: { messages: true },
         },
       },
     });
 
-    if (!conversation) {
-      return NextResponse.json({ conversation: null, messages: [] });
-    }
-
-    return NextResponse.json({
-      conversation: {
-        id: conversation.id,
-        title: conversation.title,
-        createdAt: conversation.createdAt,
-      },
-      messages: conversation.messages.map((m) => ({
-        id: m.id,
-        conversationId: m.conversationId,
-        role: m.role,
-        content: m.content,
-        citations: m.citations,
-        interrupted: m.interrupted,
-        createdAt: m.createdAt,
-      })),
+    const relevant = allConvs.filter((c) => {
+      if (c.documentId === documentId) return true;
+      if (Array.isArray(c.documentIds) && (c.documentIds as string[]).includes(documentId)) return true;
+      return false;
     });
+
+    const mapped = relevant.map((c) => ({
+      id: c.id,
+      title: c.title,
+      documentId: c.documentId,
+      documentIds: c.documentIds,
+      messageCount: c._count.messages,
+      createdAt: c.createdAt,
+      updatedAt: c.updatedAt,
+    }));
+
+    return NextResponse.json({ conversations: mapped });
   } catch (err: unknown) {
     console.error('Failed to get chat history:', err);
     return NextResponse.json({ error: 'Failed to retrieve chat history' }, { status: 500 });
-  }
-}
-
-/**
- * Endpoint called when generation is aborted / stopped to persist the partial response.
- */
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const { conversationId, role, content, citations, interrupted = true } = body;
-
-    if (!conversationId || !content) {
-      return NextResponse.json({ error: 'conversationId and content are required' }, { status: 400 });
-    }
-
-    const message = await prisma.message.create({
-      data: {
-        conversationId,
-        role: role || 'assistant',
-        content,
-        citations: citations ? JSON.parse(JSON.stringify(citations)) : null,
-        interrupted,
-      },
-    });
-
-    return NextResponse.json({ success: true, messageId: message.id });
-  } catch (err: unknown) {
-    console.error('Failed to save interrupted message:', err);
-    return NextResponse.json({ error: 'Failed to save message' }, { status: 500 });
   }
 }

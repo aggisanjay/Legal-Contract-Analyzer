@@ -75,6 +75,15 @@ body {
   border-bottom: 2px solid #d97706;
   border-radius: 2px;
   pointer-events: none;
-  animation: highlight-pulse 2s ease-in-out infinite;
+  animation: highlight-pulse 2s ease-in-out 3;
   z-index: 20;
+}
+
+.citation-highlight-secondary {
+  position: absolute;
+  background-color: rgba(251, 191, 36, 0.2);
+  border-bottom: 1px dashed #d97706;
+  border-radius: 2px;
+  pointer-events: none;
+  z-index: 19;
 }
