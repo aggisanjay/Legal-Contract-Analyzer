@@ -30,7 +30,7 @@ import {
   CoverageInfo,
   AgentTimelineStep,
 } from '@/lib/types';
-import { formatPageRanges } from '@/lib/utils/format';
+import { formatPageRanges, deduplicateVerifiedCitations } from '@/lib/utils/format';
 
 interface ChatPanelProps {
   activeDocument: DocumentMetadata | null;
@@ -669,17 +669,24 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                 )}
 
                 {/* Verified Citations List */}
-                {!isUser && citations.length > 0 && (
-                  <div className="w-full mt-2.5 space-y-2">
-                    <div className="flex items-center justify-between text-[10px] font-semibold text-slate-500 uppercase tracking-wider px-1">
-                      <span>Verified Quotes ({citations.length})</span>
-                      <span className="text-emerald-700 font-medium normal-case">Server Verified</span>
-                    </div>
+                {!isUser && citations.length > 0 && (() => {
+                  const distinctCitations = deduplicateVerifiedCitations(citations);
+                  return (
+                    <div className="w-full mt-2.5 space-y-2">
+                      <div className="flex items-center justify-between text-[10px] font-semibold text-slate-500 uppercase tracking-wider px-1">
+                        <span>Verified Quotes ({distinctCitations.length})</span>
+                        <span className="text-emerald-700 font-medium normal-case">Server Verified</span>
+                      </div>
 
-                    {citations.map((cit, cIdx) => {
-                      const isExpanded = expandedQuotes[cit.id || `c_${cIdx}`] ?? false;
-                      const pageLabel =
-                        cit.pageStart && cit.pageEnd && cit.pageEnd > cit.pageStart
+                      {distinctCitations.map((cit, cIdx) => {
+                        const isExpanded = expandedQuotes[cit.id || `c_${cIdx}`] ?? false;
+                        const isMultiOcc = cit.occurrences && cit.occurrences.length > 1;
+                        const occPages = isMultiOcc
+                          ? cit.occurrences!.map((o: any) => (o.pageStart === o.pageEnd ? `${o.pageStart}` : `${o.pageStart}–${o.pageEnd}`)).join(', ')
+                          : '';
+                        const pageLabel = isMultiOcc
+                          ? `Occurs ${cit.occurrences!.length}× — pp. ${occPages}`
+                          : cit.pageStart && cit.pageEnd && cit.pageEnd > cit.pageStart
                           ? `pp. ${cit.pageStart}–${cit.pageEnd}`
                           : cit.pageStart
                           ? `p. ${cit.pageStart}`
@@ -745,7 +752,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                       );
                     })}
                   </div>
-                )}
+                );
+              })()}
 
                 {/* Unverified Group (Collapsed by default, amber styling, not clickable) */}
                 {!isUser && unverified.length > 0 && (

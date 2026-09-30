@@ -12,6 +12,7 @@ import { CONTRACT_QA_SYSTEM_PROMPT, MULTI_DOC_QA_SYSTEM_PROMPT } from '@/lib/ai/
 import { runAgenticDocumentResearch } from '@/lib/ai/agent';
 import { verifyQuoteForDocument } from '@/lib/quotes/quote-verifier';
 import { VerifiedCitation } from '@/lib/types';
+import { deduplicateVerifiedCitations, normalizeQuoteForDedup } from '@/lib/utils/format';
 
 export const dynamic = 'force-dynamic';
 
@@ -299,6 +300,7 @@ export async function POST(req: NextRequest) {
               }
             }
 
+            const seenQuoteKeys = new Set<string>();
             for (let i = 0; i < candidateCitations.length; i++) {
               const cand = candidateCitations[i];
               if (!cand.quote) continue;
@@ -321,6 +323,10 @@ export async function POST(req: NextRequest) {
                 continue;
               }
 
+              const quoteKey = `${targetDocInfo.id}::${normalizeQuoteForDedup(cand.quote)}`;
+              if (seenQuoteKeys.has(quoteKey)) continue;
+              seenQuoteKeys.add(quoteKey);
+
               const vResult = await verifyQuoteForDocument(targetDocInfo.id, cand.quote);
               if (vResult.verified) {
                 const cit: VerifiedCitation = {
@@ -333,6 +339,7 @@ export async function POST(req: NextRequest) {
                   endOffset: vResult.endOffset,
                   pageStart: vResult.pageStart,
                   pageEnd: vResult.pageEnd,
+                  occurrences: vResult.occurrences,
                 };
                 collectedCitations.push(cit);
                 sendEvent('citation', cit);
@@ -509,9 +516,14 @@ export async function POST(req: NextRequest) {
                 }
               }
 
+              const seenSingleQuoteKeys = new Set<string>();
               for (let i = 0; i < candidateCitations.length; i++) {
                 const cand = candidateCitations[i];
                 if (!cand.quote) continue;
+
+                const quoteKey = `${docIds[0]}::${normalizeQuoteForDedup(cand.quote)}`;
+                if (seenSingleQuoteKeys.has(quoteKey)) continue;
+                seenSingleQuoteKeys.add(quoteKey);
 
                 const vResult = await verifyQuoteForDocument(
                   docIds[0],
@@ -530,6 +542,7 @@ export async function POST(req: NextRequest) {
                     endOffset: vResult.endOffset,
                     pageStart: vResult.pageStart,
                     pageEnd: vResult.pageEnd,
+                    occurrences: vResult.occurrences,
                   };
                   collectedCitations.push(cit);
                   sendEvent('citation', cit);
@@ -634,12 +647,13 @@ export async function POST(req: NextRequest) {
 
           // Persist completed message in database if not aborted
           if (!req.signal.aborted) {
+            const finalCitations = deduplicateVerifiedCitations(collectedCitations);
             await prisma.message.create({
               data: {
                 conversationId: convId,
                 role: 'assistant',
                 content: fullGeneratedText.trim(),
-                citations: JSON.parse(JSON.stringify(collectedCitations)),
+                citations: JSON.parse(JSON.stringify(finalCitations)),
                 interrupted: false,
                 verifiedCount: collectedCitations.length,
                 unverifiedCount: collectedUnverified.length,

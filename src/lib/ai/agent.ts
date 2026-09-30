@@ -3,9 +3,10 @@ import { aiClient, ChatMessageParam, ToolDefinition } from './client';
 import { retrieveChunksForDocument, getSectionContent, listDocumentClauses } from './retriever';
 import { verifyQuoteForDocument } from '../quotes/quote-verifier';
 import { AGENT_RESEARCH_SYSTEM_PROMPT } from './prompts';
-import { AgentProgressEvent, VerifiedCitation } from '../types';
 import { prisma } from '../prisma';
+import { AgentProgressEvent, VerifiedCitation } from '../types';
 import { enforceAbsenceCoverage } from './coverage';
+import { deduplicateVerifiedCitations } from '../utils/format';
 
 export const SearchDocumentSchema = z.object({
   query: z.string().min(1, 'Query must not be empty'),
@@ -487,15 +488,18 @@ export async function runAgenticDocumentResearch(
         endOffset: vResult.endOffset,
         pageStart: vResult.pageStart,
         pageEnd: vResult.pageEnd,
+        occurrences: vResult.occurrences,
       });
     } else {
       console.warn(`[Agent] Rejected unverified quote: "${candidate.quote}" (${vResult.reason})`);
     }
   }
 
+  const dedupedCitations = deduplicateVerifiedCitations(verifiedCitations);
+
   onProgress?.({
     stage: 'done',
-    message: `Research complete with ${verifiedCitations.length} verified citation${verifiedCitations.length === 1 ? '' : 's'}.`,
+    message: `Research complete with ${dedupedCitations.length} verified citation${dedupedCitations.length === 1 ? '' : 's'}.`,
     round,
   });
 
@@ -540,7 +544,7 @@ export async function runAgenticDocumentResearch(
 
   return {
     answer: answerProse,
-    citations: enforced.isAbsence ? [] : verifiedCitations,
+    citations: enforced.isAbsence ? [] : dedupedCitations,
     roundsExecuted: round,
     coverage,
   };

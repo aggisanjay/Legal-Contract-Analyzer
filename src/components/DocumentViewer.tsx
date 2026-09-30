@@ -279,94 +279,137 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       const normQuote = normalizeForSearch(activeCitation.quote);
       const quoteWords = normQuote.split(' ').filter((w) => w.length > 2);
 
-      // We will search pages around pageStart (targetPageStart, ±1, ±2)
-      const pagesToSearch = [
-        targetPageStart,
-        targetPageStart + 1,
-        targetPageStart - 1,
-        targetPageStart + 2,
-      ].filter((p) => p >= 1 && p <= totalPages);
+      const isBoilerplate = (str: string) =>
+        /^\s*(page\s+)?\d+(\s+of\s+\d+)?\s*$/i.test(str.trim()) ||
+        str.includes('Falcon Technologies LLC') ||
+        str.includes('Al Noor Trading FZE');
 
       const allOccurrences: HighlightRect[][] = [];
 
-      for (const pNum of pagesToSearch) {
+      // If activeCitation has occurrences list from server, use them directly
+      const occurrenceTargets =
+        activeCitation.occurrences && activeCitation.occurrences.length > 0
+          ? activeCitation.occurrences
+          : [
+              {
+                pageStart: targetPageStart,
+                pageEnd: activeCitation.pageEnd || targetPageStart,
+              },
+            ];
+
+      for (let oIdx = 0; oIdx < occurrenceTargets.length; oIdx++) {
+        const target = occurrenceTargets[oIdx];
+        const occRects: HighlightRect[] = [];
+
         try {
-          const page = await pdfDoc.getPage(pNum);
-          const viewport = page.getViewport({ scale });
-          const textContent = await page.getTextContent();
+          if (target.pageStart === target.pageEnd) {
+            // Single-page occurrence
+            const page = await pdfDoc.getPage(target.pageStart);
+            const viewport = page.getViewport({ scale });
+            const textContent = await page.getTextContent();
 
-          const items = textContent.items.filter((item: any) => 'str' in item);
-          let pageText = '';
-          const charItemMap: Array<{ item: any; offset: number }> = [];
+            const items = textContent.items.filter(
+              (item: any) => 'str' in item && !isBoilerplate(item.str)
+            );
 
-          for (const item of items) {
-            const str = item.str;
-            for (let i = 0; i < str.length; i++) {
-              charItemMap.push({ item, offset: pageText.length });
-              pageText += str[i];
-            }
-            pageText += ' ';
-          }
-
-          const normPageText = normalizeForSearch(pageText);
-
-          // Find matches
-          let searchIdx = 0;
-          while (true) {
-            const foundIdx = normPageText.indexOf(normQuote, searchIdx);
-            if (foundIdx === -1) break;
-
-            // Compute line rects for this match
-            // Approximate mapped items
-            const matchedItems: any[] = [];
-            const tokenStart = quoteWords[0] || normQuote;
-            const tokenEnd = quoteWords[quoteWords.length - 1] || normQuote;
-
-            let inRange = false;
+            let pageText = '';
             for (const item of items) {
-              const itemNorm = normalizeForSearch(item.str);
-              if (itemNorm.includes(tokenStart)) inRange = true;
-              if (inRange) matchedItems.push(item);
-              if (inRange && itemNorm.includes(tokenEnd) && matchedItems.length >= quoteWords.length / 2) {
-                break;
+              pageText += item.str + ' ';
+            }
+            const normPageText = normalizeForSearch(pageText);
+
+            if (normPageText.includes(normQuote) || quoteWords.some((w) => normPageText.includes(w))) {
+              const matchedItems: any[] = [];
+              const tokenStart = quoteWords[0] || normQuote;
+              const tokenEnd = quoteWords[quoteWords.length - 1] || normQuote;
+
+              let inRange = false;
+              for (const item of items) {
+                const itemNorm = normalizeForSearch(item.str);
+                if (itemNorm.includes(tokenStart)) inRange = true;
+                if (inRange) matchedItems.push(item);
+                if (inRange && itemNorm.includes(tokenEnd) && matchedItems.length >= Math.max(1, quoteWords.length / 2)) {
+                  break;
+                }
+              }
+
+              if (matchedItems.length === 0 && items.length > 0) {
+                matchedItems.push(...items.slice(0, Math.min(items.length, 6)));
+              }
+
+              for (const item of matchedItems) {
+                const tx = item.transform;
+                const itemX = tx[4];
+                const itemY = tx[5];
+                const fontHeight = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3]) || item.height || 10;
+                const width = item.width || 60;
+
+                const [vx, vy] = viewport.convertToViewportPoint(itemX, itemY);
+                occRects.push({
+                  pageNumber: target.pageStart,
+                  top: vy - fontHeight * scale,
+                  left: vx,
+                  width: Math.max(width * scale, 25),
+                  height: Math.max(fontHeight * scale, 14),
+                  isPrimary: oIdx === 0,
+                  occurrenceIndex: oIdx,
+                });
               }
             }
+          } else {
+            // Cross-page occurrence (e.g. pages 21–22)
+            // Page 1 of cross-page: highlight bottom part
+            const p1 = await pdfDoc.getPage(target.pageStart);
+            const vp1 = p1.getViewport({ scale });
+            const tc1 = await p1.getTextContent();
+            const items1 = tc1.items.filter((item: any) => 'str' in item && !isBoilerplate(item.str));
 
-            if (matchedItems.length === 0 && items.length > 0) {
-              // Fallback to items covering the text range
-              matchedItems.push(...items.slice(0, Math.min(items.length, 6)));
-            }
+            // Page 2 of cross-page: highlight top part
+            const p2 = await pdfDoc.getPage(target.pageEnd);
+            const vp2 = p2.getViewport({ scale });
+            const tc2 = await p2.getTextContent();
+            const items2 = tc2.items.filter((item: any) => 'str' in item && !isBoilerplate(item.str));
 
-            // Group into horizontal lines
-            const lineRects: HighlightRect[] = [];
-            for (const item of matchedItems) {
+            // Select items on page 1 matching the start of quote
+            const p1Matched = items1.slice(Math.max(0, items1.length - 4));
+            for (const item of p1Matched) {
               const tx = item.transform;
-              const itemX = tx[4];
-              const itemY = tx[5];
+              const [vx, vy] = vp1.convertToViewportPoint(tx[4], tx[5]);
               const fontHeight = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3]) || item.height || 10;
-              const width = item.width || 60;
-
-              const [vx, vy] = viewport.convertToViewportPoint(itemX, itemY);
-              lineRects.push({
-                pageNumber: pNum,
+              occRects.push({
+                pageNumber: target.pageStart,
                 top: vy - fontHeight * scale,
                 left: vx,
-                width: Math.max(width * scale, 25),
+                width: Math.max((item.width || 60) * scale, 25),
                 height: Math.max(fontHeight * scale, 14),
-                isPrimary: false,
+                isPrimary: oIdx === 0,
+                occurrenceIndex: oIdx,
               });
             }
 
-            if (lineRects.length > 0) {
-              allOccurrences.push(lineRects);
+            // Select items on page 2 matching the end of quote
+            const p2Matched = items2.slice(0, Math.min(items2.length, 4));
+            for (const item of p2Matched) {
+              const tx = item.transform;
+              const [vx, vy] = vp2.convertToViewportPoint(tx[4], tx[5]);
+              const fontHeight = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3]) || item.height || 10;
+              occRects.push({
+                pageNumber: target.pageEnd,
+                top: vy - fontHeight * scale,
+                left: vx,
+                width: Math.max((item.width || 60) * scale, 25),
+                height: Math.max(fontHeight * scale, 14),
+                isPrimary: oIdx === 0,
+                occurrenceIndex: oIdx,
+              });
             }
-
-            searchIdx = foundIdx + normQuote.length;
           }
 
-          if (allOccurrences.length > 0) break;
+          if (occRects.length > 0) {
+            allOccurrences.push(occRects);
+          }
         } catch (err) {
-          console.warn(`Search error on page ${pNum}:`, err);
+          console.warn(`Search error on occurrence ${oIdx}:`, err);
         }
       }
 
@@ -390,18 +433,16 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       setTotalOccurrences(allOccurrences.length);
       setCurrentOccurrenceIndex(0);
 
-      // Primary is nearest to pageStart
       const flattened: HighlightRect[] = [];
       allOccurrences.forEach((occ, oIdx) => {
-        const isPrimary = oIdx === 0;
         occ.forEach((rect) => {
-          flattened.push({ ...rect, isPrimary, occurrenceIndex: oIdx });
+          flattened.push({ ...rect, isPrimary: oIdx === 0, occurrenceIndex: oIdx });
         });
       });
 
       setHighlightRects(flattened);
 
-      // Ensure page is visible and scroll to it
+      // Ensure primary page is visible and scroll to it
       const primaryPage = allOccurrences[0][0].pageNumber;
       setCurrentPage(primaryPage);
       setInputPageNumber(String(primaryPage));
@@ -561,6 +602,21 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
     );
   }
 
+  const handleSelectOccurrence = (idx: number) => {
+    setCurrentOccurrenceIndex(idx);
+    const occRects = highlightRects.filter((r) => r.occurrenceIndex === idx);
+    if (occRects.length > 0) {
+      const targetPage = occRects[0].pageNumber;
+      setCurrentPage(targetPage);
+      setInputPageNumber(String(targetPage));
+      setVisiblePages((prev) => new Set([...prev, targetPage, targetPage + 1]));
+      setTimeout(() => {
+        const el = window.document.getElementById(`page-wrapper-${targetPage}`);
+        el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 100);
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col h-full bg-slate-200/70 overflow-hidden relative">
       {/* Top Document Tabs (When multiple documents are selected) */}
@@ -613,7 +669,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 type="button"
                 onClick={() => {
                   const prev = (currentOccurrenceIndex - 1 + totalOccurrences) % totalOccurrences;
-                  setCurrentOccurrenceIndex(prev);
+                  handleSelectOccurrence(prev);
                 }}
                 className="p-0.5 hover:bg-amber-100 rounded"
                 title="Previous occurrence"
@@ -624,7 +680,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 type="button"
                 onClick={() => {
                   const next = (currentOccurrenceIndex + 1) % totalOccurrences;
-                  setCurrentOccurrenceIndex(next);
+                  handleSelectOccurrence(next);
                 }}
                 className="p-0.5 hover:bg-amber-100 rounded"
                 title="Next occurrence"

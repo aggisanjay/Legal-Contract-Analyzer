@@ -797,6 +797,92 @@ Page 10: The parties shall maintain confidentiality.`;
       expect(repairedRes.verified).toBe(true);
     });
   });
+
+  describe('Defect 3: Multiple Occurrences & Quote Deduplication', () => {
+    let v1PdfBuffer: Buffer;
+
+    beforeAll(async () => {
+      const v1Path = path.join(process.cwd(), 'fixtures', 'large-contract-v1-150pages.pdf');
+      try {
+        v1PdfBuffer = await fs.readFile(v1Path);
+      } catch {
+        const { generateBenchmark150PageContract } = await import('../scripts/create-benchmark-fixtures');
+        await generateBenchmark150PageContract('large-contract-v1-150pages.pdf', {
+          liabilityCap: 'AED 100,000',
+          noticeDays: 'thirty (30)',
+        });
+        v1PdfBuffer = await fs.readFile(v1Path);
+      }
+    });
+
+    it('returns all occurrences across the document (pp. 9 and 150)', async () => {
+      const extracted = await extractPdfText(v1PdfBuffer);
+      const confQuote =
+        'The parties shall maintain confidentiality of all proprietary technical data and commercial disclosures.';
+
+      const res = verifyQuote({
+        documentId: 'v1-doc',
+        candidateQuote: confQuote,
+        canonicalText: extracted.text,
+        pages: extracted.pages.map((p) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        noiseSpans: extracted.noiseSpans,
+      });
+
+      expect(res.verified).toBe(true);
+      if (res.verified) {
+        expect(res.occurrences).toBeDefined();
+        expect(res.occurrences!.length).toBe(2);
+        const pagesFound = res.occurrences!.map((o) => o.pageStart);
+        expect(pagesFound).toContain(9);
+        expect(pagesFound).toContain(150);
+      }
+    });
+
+    it('merges duplicate quotes returned by model into a single distinct citation with multiple occurrences', async () => {
+      const { deduplicateVerifiedCitations } = await import('../src/lib/utils/format');
+
+      const rawCitations = [
+        {
+          id: 'cit_1',
+          documentId: 'doc_1',
+          quote:
+            'The parties shall maintain confidentiality of all proprietary technical data and commercial disclosures.',
+          verified: true,
+          startOffset: 100,
+          endOffset: 205,
+          pageStart: 9,
+          pageEnd: 9,
+          occurrences: [
+            { startOffset: 100, endOffset: 205, pageStart: 9, pageEnd: 9 },
+          ],
+        },
+        {
+          id: 'cit_2',
+          documentId: 'doc_1',
+          quote:
+            '“The parties shall maintain confidentiality of all proprietary technical data and commercial disclosures.”',
+          verified: true,
+          startOffset: 5000,
+          endOffset: 5105,
+          pageStart: 150,
+          pageEnd: 150,
+          occurrences: [
+            { startOffset: 5000, endOffset: 5105, pageStart: 150, pageEnd: 150 },
+          ],
+        },
+      ];
+
+      const merged = deduplicateVerifiedCitations(rawCitations);
+      expect(merged.length).toBe(1);
+      expect(merged[0].occurrences?.length).toBe(2);
+      expect(merged[0].occurrences?.map((o: any) => o.pageStart)).toEqual([9, 150]);
+    });
+  });
 });
+
 
 
