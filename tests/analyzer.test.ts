@@ -882,7 +882,67 @@ Page 10: The parties shall maintain confidentiality.`;
       expect(merged[0].occurrences?.map((o: any) => o.pageStart)).toEqual([9, 150]);
     });
   });
+
+  describe('Defect 4: Verified Quote Evidence Support Check & Process Sanitization', () => {
+    it('marks quotes in absence answers as related rather than green evidence', async () => {
+      const { checkQuoteSupport } = await import('../src/lib/quotes/quote-support');
+
+      const question = 'Does the contract contain a non-compete clause?';
+      const answer = 'The contract does not contain any non-compete clause.';
+      const quote =
+        'The parties shall maintain confidentiality of all proprietary technical data and commercial disclosures.';
+
+      const result = checkQuoteSupport(question, answer, quote, true);
+      expect(result.supportsClaim).toBe(false);
+      expect(result.supportStatus).toBe('related');
+      expect(result.warning).toContain('Related passages');
+    });
+
+    it('flags verified text that has zero overlap with question terms as may not support claim', async () => {
+      const { checkQuoteSupport } = await import('../src/lib/quotes/quote-support');
+
+      const question = 'Is there a non-compete clause in the contract?';
+      const answer = 'There is no non-compete restriction.';
+      const irrelevantQuote =
+        'The parties shall maintain confidentiality of all proprietary technical data and commercial disclosures.';
+
+      const result = checkQuoteSupport(question, answer, irrelevantQuote, false);
+      expect(result.supportsClaim).toBe(false);
+      expect(result.supportStatus).toBe('unsupported');
+      expect(result.warning).toBe('Verified text, but may not support this claim');
+    });
+
+    it('passes verified text that directly supports the question claim', async () => {
+      const { checkQuoteSupport } = await import('../src/lib/quotes/quote-support');
+
+      const question = 'When are deliverables deemed accepted?';
+      const answer = 'Deliverables are deemed accepted upon expiry of the review period.';
+      const relevantQuote =
+        'All submitted deliverables shall be deemed accepted upon expiry of the review period';
+
+      const result = checkQuoteSupport(question, answer, relevantQuote, false);
+      expect(result.supportsClaim).toBe(true);
+      expect(result.supportStatus).toBe('supported');
+      expect(result.warning).toBeUndefined();
+    });
+
+    it('sanitizes self-referential process descriptions from model output', async () => {
+      const { sanitizeProcessDescriptions } = await import('../src/lib/quotes/quote-support');
+
+      const noisyAnswer =
+        'Based on a thorough review of the contract and its clause index, the contract does not contain a non-compete clause.';
+      const sanitized = sanitizeProcessDescriptions(noisyAnswer);
+      expect(sanitized).toBe('the contract does not contain a non-compete clause.');
+      expect(sanitized).not.toContain('thorough review');
+      expect(sanitized).not.toContain('clause index');
+
+      const reviewedPrefix = 'I reviewed all sections of the contract. The governing law is English law.';
+      const sanitizedPrefix = sanitizeProcessDescriptions(reviewedPrefix);
+      expect(sanitizedPrefix).toBe('The governing law is English law.');
+    });
+  });
 });
+
 
 
 

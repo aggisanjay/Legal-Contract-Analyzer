@@ -11,8 +11,10 @@ import {
 import { CONTRACT_QA_SYSTEM_PROMPT, MULTI_DOC_QA_SYSTEM_PROMPT } from '@/lib/ai/prompts';
 import { runAgenticDocumentResearch } from '@/lib/ai/agent';
 import { verifyQuoteForDocument } from '@/lib/quotes/quote-verifier';
+import { isAbsenceClaim } from '@/lib/ai/coverage';
 import { VerifiedCitation } from '@/lib/types';
 import { deduplicateVerifiedCitations, normalizeQuoteForDedup } from '@/lib/utils/format';
+import { checkQuoteSupport, sanitizeProcessDescriptions } from '@/lib/quotes/quote-support';
 
 export const dynamic = 'force-dynamic';
 
@@ -329,6 +331,8 @@ export async function POST(req: NextRequest) {
 
               const vResult = await verifyQuoteForDocument(targetDocInfo.id, cand.quote);
               if (vResult.verified) {
+                const isAbsence = isAbsenceClaim(fullGeneratedText);
+                const support = checkQuoteSupport(question, fullGeneratedText, vResult.quote, isAbsence);
                 const cit: VerifiedCitation = {
                   id: `cit_${Date.now()}_${i}`,
                   documentId: targetDocInfo.id,
@@ -340,6 +344,8 @@ export async function POST(req: NextRequest) {
                   pageStart: vResult.pageStart,
                   pageEnd: vResult.pageEnd,
                   occurrences: vResult.occurrences,
+                  supportStatus: support.supportStatus,
+                  supportWarning: support.warning,
                 };
                 collectedCitations.push(cit);
                 sendEvent('citation', cit);
@@ -532,6 +538,8 @@ export async function POST(req: NextRequest) {
                 );
 
                 if (vResult.verified) {
+                  const isAbsence = isAbsenceClaim(fullGeneratedText);
+                  const support = checkQuoteSupport(question, fullGeneratedText, vResult.quote, isAbsence);
                   const cit: VerifiedCitation = {
                     id: `cit_${Date.now()}_${i}`,
                     documentId: docIds[0],
@@ -543,6 +551,8 @@ export async function POST(req: NextRequest) {
                     pageStart: vResult.pageStart,
                     pageEnd: vResult.pageEnd,
                     occurrences: vResult.occurrences,
+                    supportStatus: support.supportStatus,
+                    supportWarning: support.warning,
                   };
                   collectedCitations.push(cit);
                   sendEvent('citation', cit);
@@ -563,6 +573,9 @@ export async function POST(req: NextRequest) {
             }
           }
 
+          // Sanitize any self-referential process descriptions from the generated answer
+          fullGeneratedText = sanitizeProcessDescriptions(fullGeneratedText);
+
           // If answer has zero verified citations and is not a "not found" answer, attempt ONE quote repair retry
           const textLower = fullGeneratedText.toLowerCase();
           const isNotFoundAnswer =
@@ -570,7 +583,8 @@ export async function POST(req: NextRequest) {
             textLower.includes('not present') ||
             textLower.includes("couldn't find") ||
             textLower.includes('cannot confirm the clause is absent') ||
-            textLower.includes("can't confirm this clause is absent");
+            textLower.includes("can't confirm this clause is absent") ||
+            isAbsenceClaim(fullGeneratedText);
 
           // Quote repair step:
           // If ALL quotes fail verification for an answer that is not a "not found" answer,
@@ -615,6 +629,8 @@ export async function POST(req: NextRequest) {
                     if (!rq.quote) continue;
                     const rv = await verifyQuoteForDocument(docIds[0], rq.quote);
                     if (rv.verified) {
+                      const isAbsence = isAbsenceClaim(fullGeneratedText);
+                      const support = checkQuoteSupport(question, fullGeneratedText, rv.quote, isAbsence);
                       const repCit: VerifiedCitation = {
                         id: `cit_${Date.now()}_rep_${rIdx}`,
                         documentId: docIds[0],
@@ -626,6 +642,8 @@ export async function POST(req: NextRequest) {
                         pageStart: rv.pageStart,
                         pageEnd: rv.pageEnd,
                         occurrences: rv.occurrences,
+                        supportStatus: support.supportStatus,
+                        supportWarning: support.warning,
                       };
                       collectedCitations.push(repCit);
                       sendEvent('citation', repCit);

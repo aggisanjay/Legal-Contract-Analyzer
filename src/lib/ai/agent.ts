@@ -7,6 +7,7 @@ import { prisma } from '../prisma';
 import { AgentProgressEvent, VerifiedCitation } from '../types';
 import { enforceAbsenceCoverage } from './coverage';
 import { deduplicateVerifiedCitations } from '../utils/format';
+import { checkQuoteSupport, sanitizeProcessDescriptions } from '../quotes/quote-support';
 
 export const SearchDocumentSchema = z.object({
   query: z.string().min(1, 'Query must not be empty'),
@@ -468,41 +469,6 @@ export async function runAgenticDocumentResearch(
     round,
   });
 
-  const verifiedCitations: VerifiedCitation[] = [];
-
-  for (let i = 0; i < candidateCitations.length; i++) {
-    const candidate = candidateCitations[i];
-    if (!candidate.quote) continue;
-
-    const docToVerify = candidate.documentId || documentId;
-    const vResult = await verifyQuoteForDocument(docToVerify, candidate.quote, candidate.chunkId);
-
-    if (vResult.verified) {
-      verifiedCitations.push({
-        id: `cit_${Date.now()}_${i}`,
-        documentId: docToVerify,
-        documentName,
-        quote: vResult.quote,
-        verified: true,
-        startOffset: vResult.startOffset,
-        endOffset: vResult.endOffset,
-        pageStart: vResult.pageStart,
-        pageEnd: vResult.pageEnd,
-        occurrences: vResult.occurrences,
-      });
-    } else {
-      console.warn(`[Agent] Rejected unverified quote: "${candidate.quote}" (${vResult.reason})`);
-    }
-  }
-
-  const dedupedCitations = deduplicateVerifiedCitations(verifiedCitations);
-
-  onProgress?.({
-    stage: 'done',
-    message: `Research complete with ${dedupedCitations.length} verified citation${dedupedCitations.length === 1 ? '' : 's'}.`,
-    round,
-  });
-
   let totalDocPages = options.pageCount || 1;
   let totalDocChunks = examinedChunkIds.size;
   try {
@@ -523,7 +489,8 @@ export async function runAgenticDocumentResearch(
   const pagesTotal = totalDocPages;
   const incomplete = pagesExamined < pagesTotal;
 
-  // Enforce absence claim protection in code
+  // Sanitize self-referential descriptions and enforce absence claim protection
+  answerProse = sanitizeProcessDescriptions(answerProse);
   const enforced = enforceAbsenceCoverage(
     answerProse,
     pagesExaminedList,
@@ -531,6 +498,44 @@ export async function runAgenticDocumentResearch(
     pagesTotal
   );
   answerProse = enforced.modifiedText;
+
+  const verifiedCitations: VerifiedCitation[] = [];
+
+  for (let i = 0; i < candidateCitations.length; i++) {
+    const candidate = candidateCitations[i];
+    if (!candidate.quote) continue;
+
+    const docToVerify = candidate.documentId || documentId;
+    const vResult = await verifyQuoteForDocument(docToVerify, candidate.quote, candidate.chunkId);
+
+    if (vResult.verified) {
+      const support = checkQuoteSupport(question, answerProse, vResult.quote, enforced.isAbsence);
+      verifiedCitations.push({
+        id: `cit_${Date.now()}_${i}`,
+        documentId: docToVerify,
+        documentName,
+        quote: vResult.quote,
+        verified: true,
+        startOffset: vResult.startOffset,
+        endOffset: vResult.endOffset,
+        pageStart: vResult.pageStart,
+        pageEnd: vResult.pageEnd,
+        occurrences: vResult.occurrences,
+        supportStatus: support.supportStatus,
+        supportWarning: support.warning,
+      });
+    } else {
+      console.warn(`[Agent] Rejected unverified quote: "${candidate.quote}" (${vResult.reason})`);
+    }
+  }
+
+  const dedupedCitations = deduplicateVerifiedCitations(verifiedCitations);
+
+  onProgress?.({
+    stage: 'done',
+    message: `Research complete with ${dedupedCitations.length} verified citation${dedupedCitations.length === 1 ? '' : 's'}.`,
+    round,
+  });
 
   const coverage: AgentCoverageInfo = {
     chunksExamined: examinedChunkIds.size,
@@ -544,7 +549,7 @@ export async function runAgenticDocumentResearch(
 
   return {
     answer: answerProse,
-    citations: enforced.isAbsence ? [] : dedupedCitations,
+    citations: dedupedCitations,
     roundsExecuted: round,
     coverage,
   };

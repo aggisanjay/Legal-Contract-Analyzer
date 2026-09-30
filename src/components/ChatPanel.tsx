@@ -695,13 +695,41 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                       return (
                         <div
                           key={`cit_${cit.id || cIdx}`}
-                          className="p-3 rounded-xl bg-emerald-50/60 hover:bg-emerald-50 border border-emerald-200 transition-all shadow-2xs"
+                          className={`p-3 rounded-xl transition-all shadow-2xs border ${
+                            cit.supportStatus === 'related'
+                              ? 'bg-slate-50/80 hover:bg-slate-100/60 border-slate-300'
+                              : cit.supportStatus === 'unsupported' || cit.supportWarning
+                              ? 'bg-amber-50/60 hover:bg-amber-50 border-amber-300'
+                              : 'bg-emerald-50/60 hover:bg-emerald-50 border-emerald-200'
+                          }`}
                         >
                           <div className="flex items-center justify-between text-[11px] mb-1.5">
                             <div className="flex items-center gap-1.5">
-                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
-                                <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                                Verified
+                              <span
+                                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                                  cit.supportStatus === 'related'
+                                    ? 'bg-slate-100 text-slate-700 border-slate-300'
+                                    : cit.supportStatus === 'unsupported' || cit.supportWarning
+                                    ? 'bg-amber-100 text-amber-900 border-amber-300'
+                                    : 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                                }`}
+                              >
+                                {cit.supportStatus === 'related' ? (
+                                  <>
+                                    <FileText className="w-3 h-3 text-slate-500" />
+                                    Related passage (does not answer question)
+                                  </>
+                                ) : cit.supportStatus === 'unsupported' || cit.supportWarning ? (
+                                  <>
+                                    <AlertTriangle className="w-3 h-3 text-amber-600" />
+                                    Verified text, but may not support this claim
+                                  </>
+                                ) : (
+                                  <>
+                                    <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                    Verified
+                                  </>
+                                )}
                               </span>
                               {pageLabel && (
                                 <span className="font-mono text-[10px] text-slate-600 font-medium">
