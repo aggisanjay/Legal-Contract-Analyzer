@@ -95,15 +95,113 @@ export async function retrieveChunksForDocument(
   return scored.slice(0, topK);
 }
 
+export interface SectionContentResult {
+  sectionNumber: string;
+  heading?: string;
+  text: string;
+  pageStart: number;
+  pageEnd: number;
+  chunkIds: string[];
+  pages: number[];
+  complete: boolean;
+  nextOffset?: number;
+}
+
 /**
- * Retrieves a specific section by sectionNumber (e.g. "12", "14.2", "Clause 14").
+ * Retrieves a specific section by sectionNumber (e.g. "12", "14.2", "Clause 14", "Article 55").
+ * Delimited by the next "Article N." / "N." heading, including clauses inside the article.
  */
 export async function getSectionContent(
   documentId: string,
-  sectionNumber: string
-): Promise<{ sectionNumber: string; text: string; pageStart: number; pageEnd: number } | null> {
+  sectionNumber: string,
+  offset: number = 0,
+  limit: number = 15000
+): Promise<SectionContentResult | null> {
   const cleanNumber = sectionNumber.replace(/^(?:section|clause|article)\s*/i, '').trim();
 
+  // Try extracting directly from canonical extractedText if available
+  try {
+    const doc = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: {
+        extractedText: true,
+        pagesJson: true,
+        chunks: {
+          orderBy: { chunkIndex: 'asc' },
+          select: { id: true, chunkIndex: true, pageStart: true, pageEnd: true, startOffset: true, endOffset: true, text: true, sectionNumber: true },
+        },
+      },
+    });
+
+    if (doc?.extractedText) {
+      const fullText = doc.extractedText;
+      // Regex for this section heading: e.g. "ARTICLE 55" or "Section 55" or "55."
+      const escapedNum = cleanNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const startRegex = new RegExp(
+        `(?:^|\\n)(?:(?:ARTICLE|Article|SECTION|Section|CLAUSE|Clause)\\s+)?${escapedNum}[.:\\s]+([^\\n\\r]*)`,
+        'i'
+      );
+
+      const startMatch = startRegex.exec(fullText);
+      if (startMatch) {
+        const sectionStart = startMatch.index;
+        const heading = startMatch[1]?.trim() || '';
+
+        // Delimit by the next "Article N." or next major section heading
+        const isArticle = /^article\b/i.test(sectionNumber) || /article/i.test(startMatch[0]);
+        let endRegex: RegExp;
+        if (isArticle) {
+          endRegex = /(?:^|\n)(?:ARTICLE|Article)\s+[0-9]+/gi;
+        } else {
+          endRegex = /(?:^|\n)(?:(?:SECTION|Section|CLAUSE|Clause|ARTICLE|Article)\s+[0-9]+|[0-9]{1,3}\.)\s+[^\n\r]+/gi;
+        }
+
+        endRegex.lastIndex = sectionStart + startMatch[0].length;
+        const nextMatch = endRegex.exec(fullText);
+        const sectionEnd = nextMatch ? nextMatch.index : fullText.length;
+
+        const totalSectionLength = sectionEnd - sectionStart;
+        const actualStart = sectionStart + offset;
+        const actualEnd = Math.min(actualStart + limit, sectionEnd);
+        const sectionText = fullText.slice(actualStart, actualEnd).trim();
+        const complete = actualEnd >= sectionEnd;
+        const nextOffset = complete ? undefined : offset + limit;
+
+        // Find covered pages and chunks
+        const coveredPages = new Set<number>();
+        const coveredChunkIds: string[] = [];
+
+        for (const c of doc.chunks) {
+          if (c.endOffset >= actualStart && c.startOffset <= actualEnd) {
+            coveredChunkIds.push(c.id);
+            for (let p = c.pageStart; p <= c.pageEnd; p++) {
+              coveredPages.add(p);
+            }
+          }
+        }
+
+        const pagesList = Array.from(coveredPages).sort((a, b) => a - b);
+        const pageStart = pagesList[0] || 1;
+        const pageEnd = pagesList[pagesList.length - 1] || pageStart;
+
+        return {
+          sectionNumber: cleanNumber,
+          heading,
+          text: sectionText,
+          pageStart,
+          pageEnd,
+          chunkIds: coveredChunkIds,
+          pages: pagesList,
+          complete,
+          nextOffset,
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('[getSectionContent] Document text lookup error:', err);
+  }
+
+  // Fallback: chunk-based lookup
   let chunks: any[] = [];
   try {
     chunks = await prisma.documentChunk.findMany({
@@ -113,6 +211,7 @@ export async function getSectionContent(
           { sectionNumber: { equals: cleanNumber, mode: 'insensitive' } },
           { sectionNumber: { contains: cleanNumber, mode: 'insensitive' } },
           { sectionTitle: { contains: cleanNumber, mode: 'insensitive' } },
+          { text: { contains: `Article ${cleanNumber}`, mode: 'insensitive' } },
           { text: { contains: `Section ${cleanNumber}`, mode: 'insensitive' } },
           { text: { contains: `Clause ${cleanNumber}`, mode: 'insensitive' } },
         ],
@@ -128,12 +227,22 @@ export async function getSectionContent(
   const combinedText = chunks.map((c) => c.text).join('\n\n');
   const pageStart = Math.min(...chunks.map((c) => c.pageStart));
   const pageEnd = Math.max(...chunks.map((c) => c.pageEnd));
+  const pagesSet = new Set<number>();
+  for (const c of chunks) {
+    for (let p = c.pageStart; p <= c.pageEnd; p++) {
+      pagesSet.add(p);
+    }
+  }
 
   return {
     sectionNumber: chunks[0].sectionNumber || cleanNumber,
+    heading: chunks[0].sectionTitle || undefined,
     text: combinedText,
     pageStart,
     pageEnd,
+    chunkIds: chunks.map((c) => c.id),
+    pages: Array.from(pagesSet).sort((a, b) => a - b),
+    complete: true,
   };
 }
 
@@ -142,7 +251,7 @@ export async function getSectionContent(
  */
 export async function listDocumentClauses(
   documentId: string
-): Promise<{ sectionNumber: string; sectionTitle: string; page: number }[]> {
+): Promise<{ sectionNumber: string; sectionTitle: string; page: number; chunkId?: string }[]> {
   let chunks: any[] = [];
   try {
     chunks = await prisma.documentChunk.findMany({
@@ -157,7 +266,7 @@ export async function listDocumentClauses(
   }
 
   const seen = new Set<string>();
-  const results: { sectionNumber: string; sectionTitle: string; page: number }[] = [];
+  const results: { sectionNumber: string; sectionTitle: string; page: number; chunkId?: string }[] = [];
 
   for (const c of chunks) {
     if (c.sectionNumber && !seen.has(c.sectionNumber)) {
@@ -166,6 +275,7 @@ export async function listDocumentClauses(
         sectionNumber: c.sectionNumber,
         sectionTitle: c.sectionTitle || 'General Provisions',
         page: c.pageStart,
+        chunkId: c.id,
       });
     }
   }

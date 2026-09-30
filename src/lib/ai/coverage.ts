@@ -1,14 +1,18 @@
 import { prisma } from '../prisma';
 import { retrieveChunksForDocument, RetrievedChunk } from './retriever';
 import { aiClient } from './client';
+import { formatPageRanges } from '../utils/format';
+export { formatPageRanges };
 
 export interface CoverageReport {
   chunksExamined: number;
   chunksTotal: number;
   pagesExamined: number;
   pagesTotal: number;
-  strategy: 'targeted' | 'map-reduce';
+  pagesExaminedList?: number[];
+  strategy: 'targeted' | 'map-reduce' | 'agentic';
   coveragePercent: number;
+  incomplete?: boolean;
   unreadPages?: number[];
   searchedPagesDesc?: string;
   unreadPagesDesc?: string;
@@ -25,45 +29,72 @@ export interface RetrievalResult {
 
 /**
  * Detects whether a question is asking for an exhaustive search, absence, existence, or all occurrences.
+ * Matches: "does the contract contain…", "any", "list every", "is there", "all clauses that…"
  */
 export function isExhaustiveQuestion(question: string): boolean {
   const q = question.toLowerCase();
   const patterns = [
-    /\b(does|is|are)\s+(the|this|any)\s+(contract|agreement)\s+(contain|have|include|mention|state)\b/i,
+    /\b(does|is|are)\s+(the|this|any)\s+(contract|agreement|document)?\s*(contain|have|include|mention|state)\b/i,
     /\bdoes\s+it\s+(contain|have|include|mention)\b/i,
-    /\b(is\s+there\s+any|are\s+there\s+any)\b/i,
-    /\b(list\s+all|find\s+all|extract\s+all|what\s+are\s+all|show\s+all)\b/i,
+    /\b(is\s+there\s+any|are\s+there\s+any|is\s+there\s+a)\b/i,
+    /\b(list\s+all|find\s+all|extract\s+all|what\s+are\s+all|show\s+all|list\s+every)\b/i,
     /\b(absence\s+of|is\s+absent|not\s+present|contain\s+any|prohibit\s+any)\b/i,
-    /\b(any\s+clause|every\s+clause|all\s+clauses)\b/i,
+    /\b(any\s+clause|every\s+clause|all\s+clauses\s+that|all\s+clauses)\b/i,
+    /\bcontain\s+a\s+non-?compete\b/i,
+    /\b(any\s+non-?compete)\b/i,
+    /\b(any\s+penalty|any\s+restriction)\b/i,
   ];
 
   return patterns.some((p) => p.test(q));
 }
 
 /**
- * Formats a list of page numbers into human-readable ranges (e.g. "1–5, 8, 12–15").
+ * Detects whether an answer claims that a clause or term is absent or not found.
  */
-export function formatPageRanges(pageNumbers: number[]): string {
-  if (!pageNumbers || pageNumbers.length === 0) return '';
-  const sorted = Array.from(new Set(pageNumbers)).sort((a, b) => a - b);
-  const ranges: string[] = [];
+export function isAbsenceClaim(text: string): boolean {
+  const t = text.toLowerCase();
+  const patterns = [
+    /\bno\s+non-?compete\b/i,
+    /\bnot\s+found\b/i,
+    /\b(?:the\s+)?(?:contract|agreement|document)\s+does\s+not\s+contain\b/i,
+    /\bdoes\s+not\s+(?:contain|have|include|mention)\b/i,
+    /\bis\s+not\s+present\b/i,
+    /\bthere\s+is\s+no\b/i,
+    /\bthere\s+are\s+no\b/i,
+    /\bno\s+mention\s+of\b/i,
+    /\bcontains\s+no\b/i,
+    /\b(?:could\s+not|cannot|can\s+not)\s+find\s+any\b/i,
+    /\bnot\s+contained\s+in\s+the\s+contract\b/i,
+    /\bno\s+such\s+clause\b/i,
+  ];
+  return patterns.some((p) => p.test(t));
+}
 
-  let start = sorted[0];
-  let prev = sorted[0];
-
-  for (let i = 1; i < sorted.length; i++) {
-    const cur = sorted[i];
-    if (cur === prev + 1) {
-      prev = cur;
-    } else {
-      ranges.push(start === prev ? `${start}` : `${start}–${prev}`);
-      start = cur;
-      prev = cur;
+/**
+ * Enforces in code: Absence claims are allowed only when pagesExamined == pagesTotal.
+ * Otherwise the server must replace:
+ * "I looked at pages X, Y but did not read the whole document, so I can't confirm this clause is absent."
+ */
+export function enforceAbsenceCoverage(
+  answer: string,
+  pagesExaminedList: number[],
+  pagesExamined: number,
+  pagesTotal: number
+): { modifiedText: string; isAbsence: boolean } {
+  const isAbsence = isAbsenceClaim(answer);
+  if (isAbsence && pagesExamined < pagesTotal) {
+    let pagesStr = 'reviewed pages';
+    if (pagesExaminedList && pagesExaminedList.length > 0) {
+      pagesStr = pagesExaminedList.length === 1
+        ? `page ${pagesExaminedList[0]}`
+        : `pages ${formatPageRanges(pagesExaminedList)}`;
     }
+    return {
+      modifiedText: `I looked at ${pagesStr} but did not read the whole document, so I can't confirm this clause is absent.`,
+      isAbsence: true,
+    };
   }
-  ranges.push(start === prev ? `${start}` : `${start}–${prev}`);
-
-  return ranges.join(', ');
+  return { modifiedText: answer, isAbsence };
 }
 
 /**
@@ -162,8 +193,10 @@ export async function executeTargetedRetrieval(
       chunksTotal: totalChunks,
       pagesExamined,
       pagesTotal,
+      pagesExaminedList: Array.from(examinedPages).sort((a, b) => a - b),
       strategy: 'targeted',
       coveragePercent,
+      incomplete: pagesExamined < pagesTotal,
     },
   };
 }
@@ -304,8 +337,10 @@ export async function executeMapReduceRetrieval(
     chunksTotal: totalChunks,
     pagesExamined,
     pagesTotal,
+    pagesExaminedList: Array.from(examinedPagesSet).sort((a, b) => a - b),
     strategy: 'map-reduce',
     coveragePercent,
+    incomplete: coveragePercent < 100,
     unreadPages: unreadPages.length > 0 ? unreadPages : undefined,
     searchedPagesDesc,
     unreadPagesDesc,

@@ -6,6 +6,7 @@ import {
   isExhaustiveQuestion,
   executeTargetedRetrieval,
   executeMapReduceRetrieval,
+  enforceAbsenceCoverage,
 } from '@/lib/ai/coverage';
 import { CONTRACT_QA_SYSTEM_PROMPT, MULTI_DOC_QA_SYSTEM_PROMPT } from '@/lib/ai/prompts';
 import { runAgenticDocumentResearch } from '@/lib/ai/agent';
@@ -24,6 +25,7 @@ export async function POST(req: NextRequest) {
       documentIds,
       question,
       useAgent = false,
+      forceMapReduce = false,
       conversationId: existingConvId,
     } = body;
 
@@ -119,8 +121,10 @@ export async function POST(req: NextRequest) {
         req.signal.addEventListener('abort', persistPartialMessage);
 
         try {
-          if (useAgent && !isMultiDoc) {
-            // --- Part C: Agentic Document Research ---
+          const isExhaustive = isExhaustiveQuestion(question) || Boolean(forceMapReduce);
+
+          if (useAgent && !isMultiDoc && !isExhaustive) {
+            // --- Part C: Agentic Document Research for targeted questions ---
             const doc = await prisma.document.findUnique({
               where: { id: docIds[0] },
               select: { originalFilename: true, pageCount: true },
@@ -129,6 +133,7 @@ export async function POST(req: NextRequest) {
             const agentRes = await runAgenticDocumentResearch({
               documentId: docIds[0],
               documentName: doc?.originalFilename || 'contract.pdf',
+              pageCount: doc?.pageCount,
               question,
               onProgress: (progress) => {
                 sendEvent('status', {
@@ -140,15 +145,8 @@ export async function POST(req: NextRequest) {
               },
             });
 
-            // Emit coverage for agent mode
-            sendEvent('coverage', {
-              chunksExamined: Math.min(10, doc?.pageCount ? doc.pageCount * 2 : 10),
-              chunksTotal: doc?.pageCount ? doc.pageCount * 3 : 20,
-              pagesExamined: doc?.pageCount || 1,
-              pagesTotal: doc?.pageCount || 1,
-              strategy: 'agentic',
-              coveragePercent: 100,
-            });
+            // Emit REAL coverage from the agent (deleted hardcoded coverage object)
+            sendEvent('coverage', agentRes.coverage);
 
             // Stream answer tokens directly
             fullGeneratedText = agentRes.answer;
@@ -362,7 +360,6 @@ export async function POST(req: NextRequest) {
               throw new Error('Document not found');
             }
 
-            const isExhaustive = isExhaustiveQuestion(question);
             let retrievalResult;
 
             if (isExhaustive) {

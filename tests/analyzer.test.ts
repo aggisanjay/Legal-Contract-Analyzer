@@ -619,4 +619,90 @@ Page 10: The parties shall maintain confidentiality.`;
       expect(hasEqual).toBe(true);
     });
   });
+
+  describe('Defect 1: Real Coverage in Agent Mode & Absence Honesty Enforcement', () => {
+    it('detects absence and exhaustive questions accurately', async () => {
+      const { isExhaustiveQuestion } = await import('../src/lib/ai/coverage');
+
+      // Exhaustive / absence questions
+      expect(isExhaustiveQuestion('Does the contract contain a non-compete clause?')).toBe(true);
+      expect(isExhaustiveQuestion('Is there any non-compete clause?')).toBe(true);
+      expect(isExhaustiveQuestion('List all indemnity clauses')).toBe(true);
+      expect(isExhaustiveQuestion('List every limitation of liability')).toBe(true);
+      expect(isExhaustiveQuestion('Show all clauses that mention termination')).toBe(true);
+      expect(isExhaustiveQuestion('Does this agreement have any restriction?')).toBe(true);
+
+      // Targeted questions must NOT be exhaustive
+      expect(isExhaustiveQuestion('What is the limitation of liability cap?')).toBe(false);
+      expect(isExhaustiveQuestion('What does Article 55 say?')).toBe(false);
+      expect(isExhaustiveQuestion('What is the governing law?')).toBe(false);
+      expect(isExhaustiveQuestion('When are deliverables deemed accepted?')).toBe(false);
+    });
+
+    it('enforces absence coverage: replaces absence claims when coverage is partial', async () => {
+      const { enforceAbsenceCoverage, isAbsenceClaim } = await import('../src/lib/ai/coverage');
+
+      const claim = 'The contract does not contain any non-compete clause.';
+      expect(isAbsenceClaim(claim)).toBe(true);
+
+      // Partial coverage: 2 of 150 pages
+      const enforced = enforceAbsenceCoverage(claim, [38, 112], 2, 150);
+      expect(enforced.isAbsence).toBe(true);
+      expect(enforced.modifiedText).toBe(
+        "I looked at pages 38, 112 but did not read the whole document, so I can't confirm this clause is absent."
+      );
+
+      // Single page partial coverage
+      const enforcedSingle = enforceAbsenceCoverage('Not found in the agreement.', [112], 1, 150);
+      expect(enforcedSingle.isAbsence).toBe(true);
+      expect(enforcedSingle.modifiedText).toBe(
+        "I looked at page 112 but did not read the whole document, so I can't confirm this clause is absent."
+      );
+
+      // Full coverage: 150 of 150 pages
+      const enforcedFull = enforceAbsenceCoverage(claim, Array.from({ length: 150 }, (_, i) => i + 1), 150, 150);
+      expect(enforcedFull.isAbsence).toBe(true);
+      expect(enforcedFull.modifiedText).toBe(claim); // Remains unchanged when full read
+    });
+
+    it('simulated partial map-reduce run refuses to assert absence', async () => {
+      const { executeMapReduceRetrieval } = await import('../src/lib/ai/coverage');
+
+      // Create a mock doc or test against document with partial batch limit
+      // With maxBatchesToProcess = 1 on a multi-batch document
+      const doc = await prisma.document.findFirst({
+        where: { status: 'READY' },
+        select: { id: true, pageCount: true },
+      });
+
+      if (doc) {
+        const partialRes = await executeMapReduceRetrieval(doc.id, 'Does the contract contain a non-compete clause?', doc.pageCount, {
+          maxBatchesToProcess: 1,
+        });
+
+        if (partialRes.coverage.coveragePercent < 100) {
+          expect(partialRes.emptyAndIncomplete).toBe(true);
+          expect(partialRes.isExhaustiveAbsent).toBeUndefined();
+          expect(partialRes.incompleteMessage).toContain('cannot confirm the clause is absent');
+        }
+      }
+    });
+
+    it('targeted questions do not report 150/150 fake coverage', async () => {
+      const { executeTargetedRetrieval } = await import('../src/lib/ai/coverage');
+
+      const doc = await prisma.document.findFirst({
+        where: { status: 'READY' },
+        select: { id: true, pageCount: true },
+      });
+
+      if (doc && doc.pageCount > 1) {
+        const targetedRes = await executeTargetedRetrieval(doc.id, 'What is the termination notice period?', doc.pageCount);
+        expect(targetedRes.coverage.strategy).toBe('targeted');
+        expect(targetedRes.coverage.pagesExamined).toBeLessThan(doc.pageCount);
+        expect(targetedRes.coverage.coveragePercent).toBeLessThan(100);
+      }
+    });
+  });
 });
+

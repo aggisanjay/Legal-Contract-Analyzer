@@ -4,6 +4,8 @@ import { retrieveChunksForDocument, getSectionContent, listDocumentClauses } fro
 import { verifyQuoteForDocument } from '../quotes/quote-verifier';
 import { AGENT_RESEARCH_SYSTEM_PROMPT } from './prompts';
 import { AgentProgressEvent, VerifiedCitation } from '../types';
+import { prisma } from '../prisma';
+import { enforceAbsenceCoverage } from './coverage';
 
 export const SearchDocumentSchema = z.object({
   query: z.string().min(1, 'Query must not be empty'),
@@ -89,15 +91,27 @@ export interface RunAgentOptions {
   documentId: string;
   documentIds?: string[];
   documentName?: string;
+  pageCount?: number;
   question: string;
   onProgress?: (event: AgentProgressEvent & { resultSummary?: string }) => void;
   maxRounds?: number;
+}
+
+export interface AgentCoverageInfo {
+  chunksExamined: number;
+  chunksTotal: number;
+  pagesExamined: number;
+  pagesTotal: number;
+  pagesExaminedList: number[];
+  strategy: 'agentic';
+  incomplete: boolean;
 }
 
 export interface AgentResult {
   answer: string;
   citations: VerifiedCitation[];
   roundsExecuted: number;
+  coverage: AgentCoverageInfo;
 }
 
 const MAX_CHAR_BUDGET = 70000;
@@ -140,6 +154,9 @@ export async function runAgenticDocumentResearch(
   let finalResponseText: string | null = null;
   let totalCharsAccumulated = 0;
   let hitBudgetLimit = false;
+
+  const examinedChunkIds = new Set<string>();
+  const examinedPagesSet = new Set<number>();
 
   while (round < maxRounds) {
     round++;
@@ -242,6 +259,14 @@ export async function runAgenticDocumentResearch(
             validated.data.topK
           );
 
+          // Track examined chunks and pages
+          for (const c of chunks) {
+            examinedChunkIds.add(c.id);
+            for (let p = c.pageStart; p <= c.pageEnd; p++) {
+              examinedPagesSet.add(p);
+            }
+          }
+
           const summary = `Found ${chunks.length} passages for "${validated.data.query}"`;
           onProgress?.({
             stage: 'reading',
@@ -287,6 +312,17 @@ export async function runAgenticDocumentResearch(
           });
 
           const section = await getSectionContent(targetDocId, validated.data.sectionNumber);
+
+          // Track examined chunks and pages
+          if (section) {
+            for (const cid of section.chunkIds) {
+              examinedChunkIds.add(cid);
+            }
+            for (const p of section.pages) {
+              examinedPagesSet.add(p);
+            }
+          }
+
           const summary = section ? `Read ${section.text.length} chars from section ${section.sectionNumber}` : 'Section not found';
 
           onProgress?.({
@@ -314,6 +350,13 @@ export async function runAgenticDocumentResearch(
           });
 
           const clauses = await listDocumentClauses(targetDocId);
+
+          // Track examined clauses and pages
+          for (const cl of clauses) {
+            if (cl.chunkId) examinedChunkIds.add(cl.chunkId);
+            examinedPagesSet.add(cl.page);
+          }
+
           const summary = `Found ${clauses.length} indexed clauses`;
 
           onProgress?.({
@@ -456,9 +499,49 @@ export async function runAgenticDocumentResearch(
     round,
   });
 
+  let totalDocPages = options.pageCount || 1;
+  let totalDocChunks = examinedChunkIds.size;
+  try {
+    const docMeta = await prisma.document.findUnique({
+      where: { id: documentId },
+      select: { pageCount: true, _count: { select: { chunks: true } } },
+    });
+    if (docMeta) {
+      totalDocPages = Math.max(docMeta.pageCount, 1);
+      totalDocChunks = docMeta._count?.chunks || examinedChunkIds.size;
+    }
+  } catch {
+    // DB fallback
+  }
+
+  const pagesExaminedList = Array.from(examinedPagesSet).sort((a, b) => a - b);
+  const pagesExamined = pagesExaminedList.length;
+  const pagesTotal = totalDocPages;
+  const incomplete = pagesExamined < pagesTotal;
+
+  // Enforce absence claim protection in code
+  const enforced = enforceAbsenceCoverage(
+    answerProse,
+    pagesExaminedList,
+    pagesExamined,
+    pagesTotal
+  );
+  answerProse = enforced.modifiedText;
+
+  const coverage: AgentCoverageInfo = {
+    chunksExamined: examinedChunkIds.size,
+    chunksTotal: totalDocChunks,
+    pagesExamined,
+    pagesTotal,
+    pagesExaminedList,
+    strategy: 'agentic',
+    incomplete,
+  };
+
   return {
     answer: answerProse,
-    citations: verifiedCitations,
+    citations: enforced.isAbsence ? [] : verifiedCitations,
     roundsExecuted: round,
+    coverage,
   };
 }

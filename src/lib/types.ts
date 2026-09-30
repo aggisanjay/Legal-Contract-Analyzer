@@ -89,8 +89,13 @@ export interface CoverageInfo {
   chunksTotal: number;
   pagesExamined: number;
   pagesTotal: number;
+  pagesExaminedList?: number[];
   strategy: string;
   incomplete?: boolean;
+  coveragePercent?: number;
+  unreadPages?: number[];
+  searchedPagesDesc?: string;
+  unreadPagesDesc?: string;
 }
 
 export interface AgentTimelineStep {

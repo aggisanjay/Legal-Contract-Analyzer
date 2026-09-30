@@ -30,6 +30,7 @@ import {
   CoverageInfo,
   AgentTimelineStep,
 } from '@/lib/types';
+import { formatPageRanges } from '@/lib/utils/format';
 
 interface ChatPanelProps {
   activeDocument: DocumentMetadata | null;
@@ -182,7 +183,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   };
 
   // Submit Question & Stream SSE Response
-  const handleSubmit = async (e?: React.FormEvent, customQuestion?: string) => {
+  const handleSubmit = async (
+    e?: React.FormEvent,
+    customQuestion?: string,
+    options?: { forceMapReduce?: boolean }
+  ) => {
     if (e) e.preventDefault();
     const q = (customQuestion || inputQuestion).trim();
     if (!q || isStreaming || !canChat) return;
@@ -213,7 +218,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
     setMessages((prev) => [...prev, userMsg, initialAssistantMsg]);
     setIsStreaming(true);
-    setStreamingStatus(useAgent ? 'Initializing autonomous research agent...' : 'Searching contract evidence...');
+    setStreamingStatus(
+      options?.forceMapReduce
+        ? 'Conducting exhaustive review of all document pages...'
+        : useAgent
+        ? 'Initializing autonomous research agent...'
+        : 'Searching contract evidence...'
+    );
     setCurrentTimeline([]);
 
     const abortController = new AbortController();
@@ -222,7 +233,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     try {
       const payload: Record<string, unknown> = {
         question: q,
-        useAgent,
+        useAgent: options?.forceMapReduce ? false : useAgent,
+        forceMapReduce: Boolean(options?.forceMapReduce),
         conversationId,
       };
 
@@ -573,26 +585,50 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                     <div className="flex items-center gap-1.5">
                       <span
                         className={`w-2 h-2 rounded-full ${
-                          msg.coverage.pagesExamined >= msg.coverage.pagesTotal && !msg.coverage.incomplete
+                          msg.coverage.pagesExamined >= msg.coverage.pagesTotal &&
+                          !msg.coverage.incomplete &&
+                          msg.coverage.strategy === 'map-reduce'
                             ? 'bg-emerald-500'
                             : 'bg-amber-500'
                         }`}
                       />
-                      <span className="font-medium text-slate-700">
-                        {msg.coverage.pagesExamined >= msg.coverage.pagesTotal && !msg.coverage.incomplete
-                          ? `Read ${msg.coverage.pagesExamined} of ${msg.coverage.pagesTotal} pages (100% complete)`
-                          : `Read ${msg.coverage.pagesExamined} of ${msg.coverage.pagesTotal} pages — result may be incomplete`}
+                      <span
+                        className="font-medium text-slate-700"
+                        title={
+                          msg.coverage.pagesExaminedList && msg.coverage.pagesExaminedList.length > 0
+                            ? `Examined pages: ${msg.coverage.pagesExaminedList.join(', ')}`
+                            : undefined
+                        }
+                      >
+                        {msg.coverage.pagesExamined >= msg.coverage.pagesTotal &&
+                        !msg.coverage.incomplete &&
+                        msg.coverage.strategy === 'map-reduce'
+                          ? `Read all ${msg.coverage.pagesTotal} of ${msg.coverage.pagesTotal} pages`
+                          : `Looked at ${
+                              msg.coverage.pagesExaminedList && msg.coverage.pagesExaminedList.length > 0
+                                ? msg.coverage.pagesExaminedList.length === 1
+                                  ? `page ${msg.coverage.pagesExaminedList[0]}`
+                                  : `pages ${formatPageRanges(msg.coverage.pagesExaminedList)}`
+                                : `pages`
+                            } (${msg.coverage.pagesExamined} of ${msg.coverage.pagesTotal}). Not an exhaustive read.`}
                       </span>
                     </div>
 
-                    {(msg.coverage.pagesExamined < msg.coverage.pagesTotal || msg.coverage.incomplete) && (
+                    {(msg.coverage.pagesExamined < msg.coverage.pagesTotal ||
+                      msg.coverage.incomplete ||
+                      msg.coverage.strategy !== 'map-reduce') && (
                       <button
                         type="button"
-                        onClick={() => handleSubmit(undefined, `Exhaustively check all pages: ${msg.content}`)}
+                        onClick={() => {
+                          const msgIdx = messages.findIndex((m) => m.id === msg.id);
+                          const userMsg = msgIdx > 0 ? messages[msgIdx - 1] : undefined;
+                          const qToRerun = userMsg?.content || msg.content;
+                          handleSubmit(undefined, qToRerun, { forceMapReduce: true });
+                        }}
                         className="text-blue-600 hover:text-blue-800 font-semibold underline flex items-center gap-0.5"
                       >
                         <RotateCcw className="w-2.5 h-2.5" />
-                        Retry remaining pages
+                        Search the whole document
                       </button>
                     )}
                   </div>
