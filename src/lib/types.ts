@@ -51,6 +51,14 @@ export interface ExtractedDocument {
     pageStart: number;
     pageEnd: number;
   }[];
+  noiseSpans?: [number, number][];
+}
+
+export interface QuoteOccurrence {
+  startOffset: number;
+  endOffset: number;
+  pageStart: number;
+  pageEnd: number;
 }
 
 export interface VerifiedCitation {
@@ -65,6 +73,9 @@ export interface VerifiedCitation {
   pageEnd?: number;
   reason?: string;
   matchScore?: number;
+  occurrences?: QuoteOccurrence[];
+  supportStatus?: 'supported' | 'unsupported' | 'related';
+  supportWarning?: string;
 }
 
 export type QuoteVerificationResult =
@@ -76,6 +87,7 @@ export type QuoteVerificationResult =
       endOffset: number;
       pageStart: number;
       pageEnd: number;
+      occurrences?: QuoteOccurrence[];
       confidence?: number;
     }
   | {

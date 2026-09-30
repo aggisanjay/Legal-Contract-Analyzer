@@ -1,4 +1,5 @@
-import { QuoteVerificationResult, ExtractedPage } from '../types';
+import { QuoteVerificationResult, ExtractedPage, QuoteOccurrence } from '../types';
+import { detectNoiseSpans } from '../documents/pdf-extractor';
 
 export interface PageInfo {
   pageNumber: number;
@@ -22,6 +23,8 @@ export interface NormalizedTextMap {
 /**
  * Normalizes text while maintaining an exact character index mapping back to original text.
  * Handles:
+ * - Skipping noise spans (running headers/footers) so cross-page quotes match seamlessly
+ * - Skipping form-feed (\f) and treating newlines between pages as whitespace
  * - Unicode NFKC normalization with per-output-character mapping (ligatures ﬁ, ﬂ, ﬀ, fractions, etc.)
  * - Stripping soft hyphens (\u00AD)
  * - Handling words hyphenated across line breaks ("terminat-\ned" -> "terminated")
@@ -29,9 +32,28 @@ export interface NormalizedTextMap {
  * - Smart quotes, dashes, non-breaking spaces
  * Invariant: normalized.length === origIndexMap.length is always guaranteed.
  */
-export function normalizeTextWithMap(text: string): NormalizedTextMap {
+export function normalizeTextWithMap(
+  text: string,
+  noiseSpans?: [number, number][]
+): NormalizedTextMap {
   if (!text) {
     return { normalized: '', origIndexMap: [] };
+  }
+
+  // Pre-sort and merge noise spans
+  const sortedSpans: [number, number][] = [];
+  if (noiseSpans && noiseSpans.length > 0) {
+    const raw = [...noiseSpans].sort((a, b) => a[0] - b[0]);
+    let curr: [number, number] = [raw[0][0], raw[0][1]];
+    for (let k = 1; k < raw.length; k++) {
+      if (raw[k][0] <= curr[1]) {
+        curr = [curr[0], Math.max(curr[1], raw[k][1])];
+      } else {
+        sortedSpans.push(curr);
+        curr = [raw[k][0], raw[k][1]];
+      }
+    }
+    sortedSpans.push(curr);
   }
 
   const normalizedChars: string[] = [];
@@ -39,8 +61,37 @@ export function normalizeTextWithMap(text: string): NormalizedTextMap {
 
   let inWhitespace = false;
   let i = 0;
+  let spanIdx = 0;
 
   while (i < text.length) {
+    // Check if i is within a noise span
+    while (spanIdx < sortedSpans.length && sortedSpans[spanIdx][1] <= i) {
+      spanIdx++;
+    }
+    if (spanIdx < sortedSpans.length && i >= sortedSpans[spanIdx][0] && i < sortedSpans[spanIdx][1]) {
+      // Jump past the noise span
+      const spanStart = sortedSpans[spanIdx][0];
+      const spanEnd = sortedSpans[spanIdx][1];
+      i = spanEnd;
+      if (!inWhitespace && normalizedChars.length > 0) {
+        normalizedChars.push(' ');
+        origIndexMap.push(spanStart > 0 ? spanStart - 1 : 0);
+        inWhitespace = true;
+      }
+      continue;
+    }
+
+    // Skip form-feed (\f) and treat as whitespace
+    if (text[i] === '\f') {
+      if (!inWhitespace && normalizedChars.length > 0) {
+        normalizedChars.push(' ');
+        origIndexMap.push(i);
+        inWhitespace = true;
+      }
+      i++;
+      continue;
+    }
+
     // 1. Strip soft hyphens (\u00AD)
     if (text[i] === '\u00AD') {
       i++;
@@ -105,7 +156,7 @@ export function normalizeTextWithMap(text: string): NormalizedTextMap {
       const isWhitespace = /\s/.test(char);
 
       if (isWhitespace) {
-        if (!inWhitespace) {
+        if (!inWhitespace && normalizedChars.length > 0) {
           normalizedChars.push(' ');
           origIndexMap.push(i);
           inWhitespace = true;
@@ -120,6 +171,12 @@ export function normalizeTextWithMap(text: string): NormalizedTextMap {
 
     i++;
   }
+
+  // Ensure invariant: normalized.length === origIndexMap.length
+  console.assert(
+    normalizedChars.length === origIndexMap.length,
+    `Invariant failed: normalized.length (${normalizedChars.length}) !== origIndexMap.length (${origIndexMap.length})`
+  );
 
   return {
     normalized: normalizedChars.join(''),
@@ -234,6 +291,7 @@ export interface QuoteVerifierOptions {
   pages: PageInfo[];
   candidateChunk?: ChunkInfo | null;
   allChunks?: ChunkInfo[];
+  noiseSpans?: [number, number][];
 }
 
 /**
@@ -286,8 +344,11 @@ export function verifyQuote(options: QuoteVerifierOptions): QuoteVerificationRes
     };
   }
 
-  // Step 2: Normalize Document with character position mapping
-  const docMap = normalizeTextWithMap(canonicalText);
+  // Step 2: Normalize Document with character position mapping & noise spans skipped
+  const spans =
+    options.noiseSpans ||
+    (pages && pages.length >= 1 ? detectNoiseSpans(pages as ExtractedPage[], canonicalText) : []);
+  const docMap = normalizeTextWithMap(canonicalText, spans);
 
   // Step 3: Exact normalized search
   let matches = findAllMatches(docMap.normalized, normQuote, false);
@@ -341,7 +402,20 @@ export function verifyQuote(options: QuoteVerifierOptions): QuoteVerificationRes
     }
   }
 
-  // Step 8: Map back to canonical offsets
+  // Map all occurrences for multi-occurrence citations (Defect 3)
+  const occurrences: QuoteOccurrence[] = matches.map((m) => {
+    const sOff = docMap.origIndexMap[m.start];
+    const eOff = docMap.origIndexMap[m.end] + 1;
+    const pRange = findPageRange(sOff, eOff, pages);
+    return {
+      startOffset: sOff,
+      endOffset: eOff,
+      pageStart: pRange.pageStart,
+      pageEnd: pRange.pageEnd,
+    };
+  });
+
+  // Step 8: Map back to canonical offsets for primary match
   const startOffset = docMap.origIndexMap[selectedMatch.start];
   const endOffset = docMap.origIndexMap[selectedMatch.end] + 1;
 
@@ -359,6 +433,7 @@ export function verifyQuote(options: QuoteVerifierOptions): QuoteVerificationRes
     endOffset,
     pageStart,
     pageEnd,
+    occurrences,
   };
 }
 
@@ -395,20 +470,36 @@ export async function verifyQuoteForDocument(
     };
   }
 
-  // Build page ranges from the real per-page offsets stored in pagesJson at extraction time
+  // Build page ranges and noiseSpans from pagesJson
   const pages: PageInfo[] = [];
-  if (Array.isArray(doc.pagesJson) && doc.pagesJson.length > 0) {
-    const rawPages = doc.pagesJson as unknown as Array<{
-      pageNumber: number;
-      startOffset: number;
-      endOffset: number;
-    }>;
-    for (const p of rawPages) {
-      pages.push({
-        pageNumber: p.pageNumber,
-        startOffset: p.startOffset,
-        endOffset: p.endOffset,
-      });
+  let noiseSpans: [number, number][] = [];
+
+  if (doc.pagesJson && typeof doc.pagesJson === 'object') {
+    if (Array.isArray(doc.pagesJson)) {
+      for (const p of doc.pagesJson as any[]) {
+        pages.push({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        });
+        if (p.noiseSpans && Array.isArray(p.noiseSpans)) {
+          noiseSpans.push(...p.noiseSpans);
+        }
+      }
+    } else {
+      const obj = doc.pagesJson as any;
+      if (Array.isArray(obj.pages)) {
+        for (const p of obj.pages) {
+          pages.push({
+            pageNumber: p.pageNumber,
+            startOffset: p.startOffset,
+            endOffset: p.endOffset,
+          });
+        }
+      }
+      if (Array.isArray(obj.noiseSpans)) {
+        noiseSpans = obj.noiseSpans;
+      }
     }
   } else if (doc.chunks && doc.chunks.length > 0) {
     // If pagesJson is not yet populated for older docs, use sorted chunks without division fallback
@@ -433,6 +524,11 @@ export async function verifyQuoteForDocument(
     pages.sort((a, b) => a.pageNumber - b.pageNumber);
   }
 
+  // If noiseSpans was not populated in db, detect dynamically from pages and text
+  if (noiseSpans.length === 0 && pages.length > 0 && doc.extractedText) {
+    noiseSpans = detectNoiseSpans(pages as ExtractedPage[], doc.extractedText);
+  }
+
   const candidateChunk = candidateChunkId
     ? doc.chunks.find((c) => c.id === candidateChunkId)
     : null;
@@ -442,6 +538,7 @@ export async function verifyQuoteForDocument(
     candidateQuote,
     canonicalText: doc.extractedText,
     pages,
+    noiseSpans,
     candidateChunk: candidateChunk
       ? {
           id: candidateChunk.id,

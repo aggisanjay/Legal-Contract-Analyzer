@@ -79,13 +79,120 @@ export async function extractPdfText(pdfBuffer: Buffer): Promise<ExtractedDocume
   // Extract detected sections from canonical text
   const sections = detectSections(canonicalFullText, pages);
 
+  // Detect running headers and footers (noise spans)
+  const noiseSpans = detectNoiseSpans(pages, canonicalFullText);
+
   return {
     text: canonicalFullText,
     pageCount: numPages,
     pages,
     sections,
+    noiseSpans,
     isScannedOrEmpty,
   };
+}
+
+/**
+ * Detects running headers and footers across pages.
+ * Per page takes first 3 and last 3 non-empty lines, normalizes digits to '#',
+ * and marks as boilerplate if normalized form occurs on >= 30% of pages (min 5 pages)
+ * or matches /^\s*(page\s+)?\d+(\s+of\s+\d+)?\s*$/i.
+ */
+export function detectNoiseSpans(pages: ExtractedPage[], fullText: string): [number, number][] {
+  if (!pages || pages.length === 0) return [];
+
+  const pageCount = pages.length;
+  const normalizedFreq = new Map<string, Set<number>>();
+  const lineCandidates: Array<{
+    pageNumber: number;
+    start: number;
+    end: number;
+    text: string;
+    normalized: string;
+  }> = [];
+
+  for (const page of pages) {
+    const pageText = fullText.slice(page.startOffset, page.endOffset);
+    const lines: Array<{ start: number; end: number; text: string }> = [];
+    let lineStart = 0;
+    const lineRegex = /\r?\n/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = lineRegex.exec(pageText)) !== null) {
+      const lineStr = pageText.slice(lineStart, match.index);
+      if (lineStr.trim().length > 0) {
+        lines.push({
+          start: page.startOffset + lineStart,
+          end: page.startOffset + match.index,
+          text: lineStr,
+        });
+      }
+      lineStart = match.index + match[0].length;
+    }
+    if (lineStart < pageText.length) {
+      const lineStr = pageText.slice(lineStart);
+      if (lineStr.trim().length > 0) {
+        lines.push({
+          start: page.startOffset + lineStart,
+          end: page.startOffset + pageText.length,
+          text: lineStr,
+        });
+      }
+    }
+
+    if (lines.length === 0) continue;
+
+    const first3 = lines.slice(0, 3);
+    const last3 = lines.length > 3 ? lines.slice(-3) : [];
+    const candidates = [...first3, ...last3];
+
+    for (const c of candidates) {
+      const trimmed = c.text.trim();
+      const normalized = trimmed.replace(/\d+/g, '#').toLowerCase();
+      lineCandidates.push({
+        pageNumber: page.pageNumber,
+        start: c.start,
+        end: c.end,
+        text: trimmed,
+        normalized,
+      });
+
+      const set = normalizedFreq.get(normalized) || new Set<number>();
+      set.add(page.pageNumber);
+      normalizedFreq.set(normalized, set);
+    }
+  }
+
+  const standalonePageRegex = /^\s*(page\s+)?\d+(\s+of\s+\d+)?\s*$/i;
+  const rawSpans: [number, number][] = [];
+
+  for (const c of lineCandidates) {
+    const isStandalonePageNum = standalonePageRegex.test(c.text);
+    const pagesWithThisLine = normalizedFreq.get(c.normalized)?.size || 0;
+    const isBoilerplate =
+      isStandalonePageNum ||
+      (pageCount >= 5 && pagesWithThisLine / pageCount >= 0.3);
+
+    if (isBoilerplate) {
+      rawSpans.push([c.start, c.end]);
+    }
+  }
+
+  if (rawSpans.length === 0) return [];
+  rawSpans.sort((a, b) => a[0] - b[0]);
+
+  const merged: [number, number][] = [rawSpans[0]];
+  for (let i = 1; i < rawSpans.length; i++) {
+    const last = merged[merged.length - 1];
+    const curr = rawSpans[i];
+    if (curr[0] <= last[1]) {
+      last[1] = Math.max(last[1], curr[1]);
+    } else {
+      merged.push(curr);
+    }
+  }
+
+  return merged;
 }
 
 /**

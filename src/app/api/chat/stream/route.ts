@@ -121,6 +121,7 @@ export async function POST(req: NextRequest) {
         req.signal.addEventListener('abort', persistPartialMessage);
 
         try {
+          let retrievalResult: any = null;
           const isExhaustive = isExhaustiveQuestion(question) || Boolean(forceMapReduce);
 
           if (useAgent && !isMultiDoc && !isExhaustive) {
@@ -360,8 +361,6 @@ export async function POST(req: NextRequest) {
               throw new Error('Document not found');
             }
 
-            let retrievalResult;
-
             if (isExhaustive) {
               sendEvent('status', { message: 'Initiating full-document map-reduce review...' });
               retrievalResult = await executeMapReduceRetrieval(
@@ -551,14 +550,82 @@ export async function POST(req: NextRequest) {
             }
           }
 
-          // If answer has zero verified citations and is not a "not found" answer, append unsupported notice
+          // If answer has zero verified citations and is not a "not found" answer, attempt ONE quote repair retry
           const textLower = fullGeneratedText.toLowerCase();
           const isNotFoundAnswer =
             textLower.includes('not found') ||
             textLower.includes('not present') ||
             textLower.includes("couldn't find") ||
-            textLower.includes('cannot confirm the clause is absent');
+            textLower.includes('cannot confirm the clause is absent') ||
+            textLower.includes("can't confirm this clause is absent");
 
+          // Quote repair step:
+          // If ALL quotes fail verification for an answer that is not a "not found" answer,
+          // run ONE retry that asks the model to re-quote verbatim from the evidence text supplied, then re-verify.
+          if (
+            collectedCitations.length === 0 &&
+            !isNotFoundAnswer &&
+            fullGeneratedText.trim().length > 0 &&
+            docIds[0]
+          ) {
+            try {
+              let evidenceForRepair = '';
+              if (typeof retrievalResult !== 'undefined' && retrievalResult?.evidenceText) {
+                evidenceForRepair = retrievalResult.evidenceText;
+              } else {
+                const chunks = await retrieveChunksForDocument(docIds[0], question, 4);
+                evidenceForRepair = chunks.map((c) => `[Page ${c.pageStart}]\n${c.text}`).join('\n\n');
+              }
+
+              if (evidenceForRepair.trim().length > 0) {
+                sendEvent('status', { message: 'Re-quoting verbatim from evidence to verify...' });
+                const repairRes = await aiClient.createChatCompletion({
+                  messages: [
+                    {
+                      role: 'system',
+                      content:
+                        'Extract 1 to 3 EXACT, VERBATIM quotes from the following contract evidence text that directly support the given answer. Return ONLY a valid JSON array of objects: [{"quote": "exact verbatim text"}]. Do not paraphrase.',
+                    },
+                    {
+                      role: 'user',
+                      content: `ANSWER:\n${fullGeneratedText}\n\nEVIDENCE:\n${evidenceForRepair}`,
+                    },
+                  ],
+                  temperature: 0,
+                });
+
+                const repairMatch = repairRes.content?.match(/\[[\s\S]*\]/);
+                if (repairMatch) {
+                  const repairedQuotes: Array<{ quote: string }> = JSON.parse(repairMatch[0]);
+                  for (let rIdx = 0; rIdx < repairedQuotes.length; rIdx++) {
+                    const rq = repairedQuotes[rIdx];
+                    if (!rq.quote) continue;
+                    const rv = await verifyQuoteForDocument(docIds[0], rq.quote);
+                    if (rv.verified) {
+                      const repCit: VerifiedCitation = {
+                        id: `cit_${Date.now()}_rep_${rIdx}`,
+                        documentId: docIds[0],
+                        documentName: 'Contract',
+                        quote: rv.quote,
+                        verified: true,
+                        startOffset: rv.startOffset,
+                        endOffset: rv.endOffset,
+                        pageStart: rv.pageStart,
+                        pageEnd: rv.pageEnd,
+                        occurrences: rv.occurrences,
+                      };
+                      collectedCitations.push(repCit);
+                      sendEvent('citation', repCit);
+                    }
+                  }
+                }
+              }
+            } catch (repairErr) {
+              console.warn('[Quote Repair] Retry error:', repairErr);
+            }
+          }
+
+          // Only if repair fails, show the warning
           if (collectedCitations.length === 0 && !isNotFoundAnswer && fullGeneratedText.trim().length > 0) {
             sendEvent('notice', {
               message: 'This answer has no verified quotes. Treat it as unsupported.',

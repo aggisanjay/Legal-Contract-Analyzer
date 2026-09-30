@@ -704,5 +704,99 @@ Page 10: The parties shall maintain confidentiality.`;
       }
     });
   });
+
+  describe('Defect 2: Cross-Page Quotes, Noise Spans, Ligatures, Hyphens & Quote Repair', () => {
+    let v1PdfBuffer: Buffer;
+
+    beforeAll(async () => {
+      const v1Path = path.join(process.cwd(), 'fixtures', 'large-contract-v1-150pages.pdf');
+      try {
+        v1PdfBuffer = await fs.readFile(v1Path);
+      } catch {
+        const { generateBenchmark150PageContract } = await import('../scripts/create-benchmark-fixtures');
+        await generateBenchmark150PageContract('large-contract-v1-150pages.pdf', {
+          liabilityCap: 'AED 100,000',
+          noticeDays: 'thirty (30)',
+        });
+        v1PdfBuffer = await fs.readFile(v1Path);
+      }
+    });
+
+    it('verifies cross-page quote across page break (pages 21-22) skipping headers/footers', async () => {
+      const extracted = await extractPdfText(v1PdfBuffer);
+      expect(extracted.pageCount).toBe(150);
+      expect(extracted.noiseSpans && extracted.noiseSpans.length).toBeGreaterThan(0);
+
+      const crossPageQuote =
+        'deliverables shall be deemed accepted upon expiry of the review period';
+
+      const res = verifyQuote({
+        documentId: 'v1-doc',
+        candidateQuote: crossPageQuote,
+        canonicalText: extracted.text,
+        pages: extracted.pages.map((p) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        noiseSpans: extracted.noiseSpans,
+      });
+
+      expect(res.verified).toBe(true);
+      if (res.verified) {
+        expect(res.pageStart).toBe(21);
+        expect(res.pageEnd).toBe(22);
+      }
+    });
+
+    it('handles ligature expansion without breaking origIndexMap length invariant', () => {
+      const textWithLigature = 'The de\uFB01nition of the party is speci\uFB01ed herein.';
+      const map = normalizeTextWithMap(textWithLigature);
+
+      expect(map.normalized).toBe('The definition of the party is specified herein.');
+      expect(map.normalized.length).toBe(map.origIndexMap.length);
+    });
+
+    it('handles hyphenated words across line breaks', () => {
+      const textWithHyphen = 'This agreement shall be terminat-\ned upon thirty days written notice.';
+      const map = normalizeTextWithMap(textWithHyphen);
+
+      expect(map.normalized).toContain('terminated upon thirty days written notice.');
+
+      const res = verifyQuote({
+        documentId: 'hyphen-doc',
+        candidateQuote: 'terminated upon thirty days',
+        canonicalText: textWithHyphen,
+        pages: [{ pageNumber: 1, startOffset: 0, endOffset: textWithHyphen.length }],
+      });
+
+      expect(res.verified).toBe(true);
+    });
+
+    it('quote repair step re-quotes verbatim from evidence when candidate quotes fail verification', async () => {
+      const evidence =
+        'Section 21.1 Inspection. Upon delivery of each milestone release, customer shall conduct tests. All submitted deliverables shall be deemed accepted upon expiry of the review period unless written notice of defect is provided.';
+
+      const hallucinatedQuote = 'Deliverables are accepted automatically after review.';
+      const failedRes = verifyQuote({
+        documentId: 'rep-doc',
+        candidateQuote: hallucinatedQuote,
+        canonicalText: evidence,
+        pages: [{ pageNumber: 21, startOffset: 0, endOffset: evidence.length }],
+      });
+      expect(failedRes.verified).toBe(false);
+
+      const verbatimRepairedQuote =
+        'deliverables shall be deemed accepted upon expiry of the review period';
+      const repairedRes = verifyQuote({
+        documentId: 'rep-doc',
+        candidateQuote: verbatimRepairedQuote,
+        canonicalText: evidence,
+        pages: [{ pageNumber: 21, startOffset: 0, endOffset: evidence.length }],
+      });
+      expect(repairedRes.verified).toBe(true);
+    });
+  });
 });
+
 
