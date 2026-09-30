@@ -1,0 +1,101 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum DocumentStatus {
+  UPLOADING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model Document {
+  id               String         @id @default(uuid())
+  filename         String
+  originalFilename String
+  mimeType         String
+  size             Int
+  status           DocumentStatus @default(UPLOADING)
+  statusMessage    String?
+  extractedText    String?        @db.Text
+  pageCount        Int            @default(0)
+  originalFilePath String
+  renderedPdfPath  String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  chunks           DocumentChunk[]
+  conversations    Conversation[]
+  comparisonsAsA   Comparison[]   @relation("DocAComparisons")
+  comparisonsAsB   Comparison[]   @relation("DocBComparisons")
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model DocumentChunk {
+  id            String   @id @default(uuid())
+  documentId    String
+  chunkIndex    Int
+  text          String   @db.Text
+  pageStart     Int
+  pageEnd       Int
+  startOffset   Int
+  endOffset     Int
+  embedding     String?  @db.Text // Stored as serialized float array for maximum compatibility
+  sectionNumber String?
+  sectionTitle  String?
+  createdAt     DateTime @default(now())
+
+  document      Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, chunkIndex])
+  @@index([documentId, sectionNumber])
+}
+
+model Conversation {
+  id         String    @id @default(uuid())
+  documentId String?
+  title      String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  document   Document? @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  messages   Message[]
+
+  @@index([documentId])
+  @@index([createdAt])
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  role           String       // 'user' | 'assistant' | 'system'
+  content        String       @db.Text
+  citations      Json?        // Verified citations array
+  interrupted    Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+}
+
+model Comparison {
+  id          String   @id @default(uuid())
+  documentAId String
+  documentBId String
+  result      Json     // Structured clause comparison results
+  createdAt   DateTime @default(now())
+
+  documentA   Document @relation("DocAComparisons", fields: [documentAId], references: [id], onDelete: Cascade)
+  documentB   Document @relation("DocBComparisons", fields: [documentBId], references: [id], onDelete: Cascade)
+
+  @@index([documentAId])
+  @@index([documentBId])
+}
