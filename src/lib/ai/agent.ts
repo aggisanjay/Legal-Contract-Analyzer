@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { aiClient, ChatMessageParam, ToolDefinition } from './client';
-import { retrieveChunksForDocument, getSectionContent, listDocumentClauses } from './retriever';
+import {
+  retrieveChunksForDocument,
+  getSectionContent,
+  listDocumentClauses,
+  detectDirectSectionQuestion,
+} from './retriever';
 import { verifyQuoteForDocument } from '../quotes/quote-verifier';
 import { AGENT_RESEARCH_SYSTEM_PROMPT } from './prompts';
 import { prisma } from '../prisma';
@@ -8,6 +13,13 @@ import { AgentProgressEvent, VerifiedCitation } from '../types';
 import { enforceAbsenceCoverage } from './coverage';
 import { deduplicateVerifiedCitations } from '../utils/format';
 import { checkQuoteSupport, sanitizeProcessDescriptions } from '../quotes/quote-support';
+
+import {
+  MACHINE_DELIMITER,
+  LEGACY_DELIMITER,
+  StreamQuoteDelimiterParser,
+  cleanAnswerPreambleAndSeparators,
+} from './stream-cleaner';
 
 export const SearchDocumentSchema = z.object({
   query: z.string().min(1, 'Query must not be empty'),
@@ -17,6 +29,8 @@ export const SearchDocumentSchema = z.object({
 
 export const GetSectionSchema = z.object({
   sectionNumber: z.string().min(1, 'Section number must not be empty'),
+  offset: z.number().int().nonnegative().optional().default(0),
+  limit: z.number().int().positive().optional().default(15000),
   documentId: z.string().optional(),
 });
 
@@ -54,13 +68,21 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'get_section',
-      description: 'Retrieve the full text of a specific contract section by its number.',
+      description: 'Retrieve the full text of a specific contract section by its number (e.g. "55", "12", "14.2", "Article 55").',
       parameters: {
         type: 'object',
         properties: {
           sectionNumber: {
             type: 'string',
-            description: 'The section or clause number, e.g. "12", "14.2", "5"',
+            description: 'The section or clause number, e.g. "12", "14.2", "55", "Article 55"',
+          },
+          offset: {
+            type: 'integer',
+            description: 'Optional character offset for paging if section was truncated',
+          },
+          limit: {
+            type: 'integer',
+            description: 'Optional character limit to retrieve (default 15000)',
           },
           documentId: {
             type: 'string',
@@ -96,6 +118,8 @@ export interface RunAgentOptions {
   pageCount?: number;
   question: string;
   onProgress?: (event: AgentProgressEvent & { resultSummary?: string }) => void;
+  onToken?: (token: string) => void;
+  signal?: AbortSignal;
   maxRounds?: number;
 }
 
@@ -132,6 +156,8 @@ export async function runAgenticDocumentResearch(
     documentName = 'contract.pdf',
     question,
     onProgress,
+    onToken,
+    signal,
   } = options;
   const maxRounds = options.maxRounds || parseInt(process.env.MAX_AGENT_ROUNDS || '5', 10) || 5;
 
@@ -148,7 +174,7 @@ export async function runAgenticDocumentResearch(
     },
     {
       role: 'user',
-      content: `Analyze this contract to answer the following question:\n"${question}"\n\nUse your research tools to explore the document before answering. Structure your final answer with prose and inline markers [[1]], [[2]], followed by delimiter "---QUOTES---" and the JSON array of candidate quotes.`,
+      content: `Analyze this contract to answer the following question:\n"${question}"\n\nUse your research tools to explore the document before answering. Structure your final answer with prose and inline markers [[1]], [[2]], followed by delimiter "<<<QUOTES>>>" and the JSON array of candidate quotes.`,
     },
   ];
 
@@ -156,11 +182,80 @@ export async function runAgenticDocumentResearch(
   let finalResponseText: string | null = null;
   let totalCharsAccumulated = 0;
   let hitBudgetLimit = false;
+  let hitCapBeforeAnswering = false;
 
   const examinedChunkIds = new Set<string>();
   const examinedPagesSet = new Set<number>();
+  const executedToolCalls = new Map<string, number>();
+  const queryCounts = new Map<string, number>();
 
-  while (round < maxRounds) {
+  // Direct section question shortcut: skip agent loop for "What does Article N say?"
+  const directSec = detectDirectSectionQuestion(question);
+  if (directSec.isDirectSection && directSec.sectionNumber) {
+    onProgress?.({
+      stage: 'reading',
+      message: `Direct section shortcut: reading Section/Article ${directSec.sectionNumber}...`,
+      round: 1,
+    });
+
+    const section = await getSectionContent(documentId, directSec.sectionNumber);
+    if (section && section.text.trim().length > 0) {
+      for (const cid of section.chunkIds) examinedChunkIds.add(cid);
+      for (const p of section.pages) examinedPagesSet.add(p);
+
+      const sectionPrompt = `You are summarizing Section/Article ${directSec.sectionNumber}${section.heading ? ` (${section.heading})` : ''} from page ${section.pageStart} to ${section.pageEnd} of the contract.
+
+Text:
+"""
+${section.text}
+"""
+
+Question: "${question}"
+
+STRICT INSTRUCTIONS:
+1. Quote and summarize the operative sentences directly (e.g. covenants, liability caps, remedies, termination terms). Do NOT paraphrase filler text.
+2. Provide at most 5 concise sentences highlighting the operative terms.
+3. Include verbatim inline citations [[1]], [[2]] for each operative quote.
+4. Structure your response into prose followed by the delimiter "<<<QUOTES>>>" and the JSON array of candidate quotes.
+5. NEVER describe your own review process.`;
+
+      try {
+        if (onToken) {
+          const parser = new StreamQuoteDelimiterParser(onToken);
+          const streamGen = aiClient.streamChatCompletion({
+            messages: [
+              { role: 'system', content: AGENT_RESEARCH_SYSTEM_PROMPT },
+              { role: 'user', content: sectionPrompt },
+            ],
+            temperature: 0.1,
+            signal,
+          });
+          for await (const chunk of streamGen) {
+            if (signal?.aborted) break;
+            parser.feed(chunk.text);
+          }
+          const flushed = parser.flush();
+          finalResponseText = `${flushed.prose}\n<<<QUOTES>>>\n${flushed.quotesJson}`;
+        } else {
+          const comp = await aiClient.createChatCompletion({
+            messages: [
+              { role: 'system', content: AGENT_RESEARCH_SYSTEM_PROMPT },
+              { role: 'user', content: sectionPrompt },
+            ],
+            temperature: 0.1,
+          });
+          if (comp.content) {
+            finalResponseText = comp.content;
+          }
+        }
+        round = 1;
+      } catch (err) {
+        console.warn('[Agent] Direct section shortcut failed, falling back to agent search:', err);
+      }
+    }
+  }
+
+  while (!finalResponseText && round < maxRounds) {
     round++;
 
     onProgress?.({
@@ -172,14 +267,44 @@ export async function runAgenticDocumentResearch(
     // Check token / character budget guard
     if (totalCharsAccumulated > MAX_CHAR_BUDGET) {
       hitBudgetLimit = true;
+      hitCapBeforeAnswering = true;
       break;
+    }
+
+    const isLastRound = round >= maxRounds;
+
+    if (isLastRound && onToken) {
+      const parser = new StreamQuoteDelimiterParser(onToken);
+      try {
+        const streamGen = aiClient.streamChatCompletion({
+          messages,
+          temperature: 0.1,
+          signal,
+        });
+        for await (const chunk of streamGen) {
+          if (signal?.aborted) break;
+          parser.feed(chunk.text);
+        }
+        const flushed = parser.flush();
+        finalResponseText = `${flushed.prose}\n<<<QUOTES>>>\n${flushed.quotesJson}`;
+        hitCapBeforeAnswering = true;
+        break;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'AI streaming completion failed';
+        onProgress?.({
+          stage: 'error',
+          message: `Research round error: ${msg}. Finalizing with gathered evidence.`,
+          round,
+        });
+        break;
+      }
     }
 
     let completion;
     try {
       completion = await aiClient.createChatCompletion({
         messages,
-        tools: AGENT_TOOLS,
+        tools: isLastRound ? undefined : AGENT_TOOLS,
         temperature: 0.1,
       });
     } catch (err: unknown) {
@@ -200,6 +325,7 @@ export async function runAgenticDocumentResearch(
         role: 'assistant',
         content: completion.content || '',
         tool_calls: toolCalls,
+        extra_content: completion.extra_content,
       });
 
       // Cap tool calls per round at MAX_TOOLS_PER_ROUND (e.g. 4)
@@ -207,6 +333,24 @@ export async function runAgenticDocumentResearch(
 
       for (const call of callsToRun) {
         const toolName = call.function.name;
+        const callSig = `${toolName}:${call.function.arguments || ''}`;
+
+        // Deduplicate repeated identical tool calls
+        if (executedToolCalls.has(callSig)) {
+          const dupRes = {
+            status: 'already retrieved',
+            message: 'This exact tool call was already executed previously. Use the evidence already retrieved instead of repeating the call.',
+          };
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            name: toolName,
+            content: JSON.stringify(dupRes),
+          });
+          continue;
+        }
+        executedToolCalls.set(callSig, (executedToolCalls.get(callSig) || 0) + 1);
+
         let parsedArgs: Record<string, unknown> = {};
 
         try {
@@ -244,6 +388,23 @@ export async function runAgenticDocumentResearch(
               tool_call_id: call.id,
               name: toolName,
               content: JSON.stringify(errRes),
+            });
+            continue;
+          }
+
+          const normQuery = validated.data.query.trim().toLowerCase();
+          const queryCount = (queryCounts.get(normQuery) || 0) + 1;
+          queryCounts.set(normQuery, queryCount);
+          if (queryCount > 2) {
+            const limitRes = {
+              status: 'query limit reached',
+              message: `The query "${validated.data.query}" has already been executed 2 times. Please formulate your final answer from the gathered evidence.`,
+            };
+            messages.push({
+              role: 'tool',
+              tool_call_id: call.id,
+              name: toolName,
+              content: JSON.stringify(limitRes),
             });
             continue;
           }
@@ -313,7 +474,12 @@ export async function runAgenticDocumentResearch(
             round,
           });
 
-          const section = await getSectionContent(targetDocId, validated.data.sectionNumber);
+          const section = await getSectionContent(
+            targetDocId,
+            validated.data.sectionNumber,
+            validated.data.offset,
+            validated.data.limit
+          );
 
           // Track examined chunks and pages
           if (section) {
@@ -396,7 +562,16 @@ export async function runAgenticDocumentResearch(
         }
       }
     } else if (completion.content) {
+      if (isLastRound) {
+        hitCapBeforeAnswering = true;
+      }
       finalResponseText = completion.content;
+      if (onToken) {
+        const parser = new StreamQuoteDelimiterParser(onToken);
+        parser.feed(completion.content);
+        const flushed = parser.flush();
+        finalResponseText = `${flushed.prose}\n<<<QUOTES>>>\n${flushed.quotesJson}`;
+      }
       break;
     } else {
       break;
@@ -405,6 +580,7 @@ export async function runAgenticDocumentResearch(
 
   // If cap was hit or budget was exceeded, force a final answer call with tools disabled
   if (!finalResponseText) {
+    hitCapBeforeAnswering = true;
     const forcedReason = hitBudgetLimit
       ? 'Context budget reached.'
       : `Research stopped at ${round} rounds.`;
@@ -417,31 +593,54 @@ export async function runAgenticDocumentResearch(
 
     messages.push({
       role: 'user',
-      content: `${forcedReason} Please formulate your final legal answer using only the gathered evidence. Include inline citations [[1]], [[2]], followed by the delimiter "---QUOTES---" and the JSON array of candidate quotes.`,
+      content: `${forcedReason} Please formulate your final legal answer using only the gathered evidence. Include inline citations [[1]], [[2]], followed by the delimiter "<<<QUOTES>>>" and the JSON array of candidate quotes.`,
     });
 
     try {
-      const finalComp = await aiClient.createChatCompletion({
-        messages,
-        temperature: 0.1,
-      });
-      finalResponseText = finalComp.content || '';
+      if (onToken) {
+        const parser = new StreamQuoteDelimiterParser(onToken);
+        const streamGen = aiClient.streamChatCompletion({
+          messages,
+          temperature: 0.1,
+          signal,
+        });
+        for await (const chunk of streamGen) {
+          if (signal?.aborted) break;
+          parser.feed(chunk.text);
+        }
+        const flushed = parser.flush();
+        finalResponseText = `${flushed.prose}\n<<<QUOTES>>>\n${flushed.quotesJson}`;
+      } else {
+        const finalComp = await aiClient.createChatCompletion({
+          messages,
+          temperature: 0.1,
+        });
+        finalResponseText = finalComp.content || '';
+      }
     } catch {
       finalResponseText =
         "I couldn't find sufficient evidence in the uploaded contract to answer this reliably.";
     }
   }
 
-  // Parse prose and quotes from finalResponseText
-  const DELIMITER = '---QUOTES---';
+  // Parse prose and quotes from finalResponseText using machine or legacy delimiter
   let answerProse = finalResponseText;
   let quotesJson = '';
 
-  const delimIdx = finalResponseText.indexOf(DELIMITER);
+  let delimIdx = finalResponseText.indexOf(MACHINE_DELIMITER);
+  let delimLen = MACHINE_DELIMITER.length;
+  if (delimIdx === -1) {
+    delimIdx = finalResponseText.indexOf(LEGACY_DELIMITER);
+    delimLen = LEGACY_DELIMITER.length;
+  }
+
   if (delimIdx !== -1) {
     answerProse = finalResponseText.slice(0, delimIdx).trim();
-    quotesJson = finalResponseText.slice(delimIdx + DELIMITER.length).trim();
+    quotesJson = finalResponseText.slice(delimIdx + delimLen).trim();
   }
+
+  // Strip any lone "---" lines or conversational preambles
+  answerProse = cleanAnswerPreambleAndSeparators(answerProse);
 
   let candidateCitations: Array<{ id?: number; documentId?: string; quote: string; chunkId?: string }> = [];
   if (quotesJson) {
@@ -457,9 +656,9 @@ export async function runAgenticDocumentResearch(
     }
   }
 
-  // If user hit rounds cap, prepend notice if not already present
-  if (round >= maxRounds && !answerProse.includes(`Research stopped at ${maxRounds} rounds`)) {
-    answerProse = `Research stopped at ${maxRounds} rounds.\n\n${answerProse}`;
+  // Move "Research stopped at N rounds" to a small footer note under the answer, ONLY when cap was hit before answering
+  if (hitCapBeforeAnswering && !answerProse.includes(`Research stopped at ${maxRounds} rounds`)) {
+    answerProse = `${answerProse}\n\n*(Research stopped at ${maxRounds} rounds)*`;
   }
 
   // Verify quotes against canonical document text

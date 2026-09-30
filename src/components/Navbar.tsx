@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { Scale, FileDiff, Sparkles, Upload, FileText, CheckCircle2 } from 'lucide-react';
+import { Scale, FileDiff, Sparkles, Upload, FileText, CheckCircle2, PanelLeft, PanelRight } from 'lucide-react';
 
 interface NavbarProps {
   onOpenUpload: () => void;
@@ -9,6 +9,10 @@ interface NavbarProps {
   selectedCount: number;
   useAgent: boolean;
   onToggleAgent: (val: boolean) => void;
+  isLibraryOpen?: boolean;
+  onToggleLibrary?: () => void;
+  isChatOpen?: boolean;
+  onToggleChat?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -17,6 +21,10 @@ export const Navbar: React.FC<NavbarProps> = ({
   selectedCount,
   useAgent,
   onToggleAgent,
+  isLibraryOpen = true,
+  onToggleLibrary,
+  isChatOpen = true,
+  onToggleChat,
 }) => {
   return (
     <header className="h-16 border-b border-slate-200 bg-white px-5 flex items-center justify-between shrink-0 z-30 shadow-sm">
@@ -72,8 +80,44 @@ export const Navbar: React.FC<NavbarProps> = ({
         )}
       </div>
 
-      {/* Right Action Buttons */}
+      {/* Right Action Buttons & Panel Toggles */}
       <div className="flex items-center gap-2.5">
+        {/* Panel Toggles for Desktop */}
+        <div className="hidden lg:flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+          {onToggleLibrary && (
+            <button
+              type="button"
+              onClick={onToggleLibrary}
+              aria-label={isLibraryOpen ? "Hide contract library" : "Show contract library"}
+              className={`p-1.5 rounded-md text-xs transition-all flex items-center gap-1.5 ${
+                isLibraryOpen
+                  ? 'bg-white text-blue-600 shadow-2xs font-semibold'
+                  : 'text-slate-500 hover:text-slate-800'
+              }`}
+              title={isLibraryOpen ? "Hide Left Panel (Library)" : "Show Left Panel (Library)"}
+            >
+              <PanelLeft className="w-3.5 h-3.5" />
+              <span className="text-[11px] hidden xl:inline">Library</span>
+            </button>
+          )}
+
+          {onToggleChat && (
+            <button
+              type="button"
+              onClick={onToggleChat}
+              aria-label={isChatOpen ? "Hide AI assistant" : "Show AI assistant"}
+              className={`p-1.5 rounded-md text-xs transition-all flex items-center gap-1.5 ${
+                isChatOpen
+                  ? 'bg-white text-blue-600 shadow-2xs font-semibold'
+                  : 'text-slate-500 hover:text-slate-800'
+              }`}
+              title={isChatOpen ? "Hide Right Panel (Assistant)" : "Show Right Panel (Assistant)"}
+            >
+              <PanelRight className="w-3.5 h-3.5" />
+              <span className="text-[11px] hidden xl:inline">Assistant</span>
+            </button>
+          )}
+        </div>
         <button
           type="button"
           onClick={onOpenCompare}

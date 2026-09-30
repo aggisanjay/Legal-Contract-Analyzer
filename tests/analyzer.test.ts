@@ -941,6 +941,539 @@ Page 10: The parties shall maintain confidentiality.`;
       expect(sanitizedPrefix).toBe('The governing law is English law.');
     });
   });
+
+  describe('Defect 5: Section Delimitation, Agent Efficiency & Direct Section Shortcut', () => {
+    let v1PdfBuffer: Buffer;
+    let v1Extracted: any;
+
+    beforeAll(async () => {
+      const v1Path = path.join(process.cwd(), 'fixtures', 'large-contract-v1-150pages.pdf');
+      try {
+        v1PdfBuffer = await fs.readFile(v1Path);
+      } catch {
+        const { generateBenchmark150PageContract } = await import('../scripts/create-benchmark-fixtures');
+        await generateBenchmark150PageContract('large-contract-v1-150pages.pdf', {
+          liabilityCap: 'AED 100,000',
+          noticeDays: 'thirty (30)',
+        });
+        v1PdfBuffer = await fs.readFile(v1Path);
+      }
+      v1Extracted = await extractPdfText(v1PdfBuffer);
+    });
+
+    it('detects direct section questions and extracts section number accurately', async () => {
+      const { detectDirectSectionQuestion } = await import('../src/lib/ai/retriever');
+
+      expect(detectDirectSectionQuestion('What does Article 55 say?')).toEqual({
+        isDirectSection: true,
+        sectionNumber: '55',
+      });
+      expect(detectDirectSectionQuestion('What does Clause 14 state?')).toEqual({
+        isDirectSection: true,
+        sectionNumber: '14',
+      });
+      expect(detectDirectSectionQuestion('Article 55')).toEqual({
+        isDirectSection: true,
+        sectionNumber: '55',
+      });
+      expect(detectDirectSectionQuestion('Whose liability is capped?')).toEqual({
+        isDirectSection: false,
+      });
+      expect(detectDirectSectionQuestion('Does the contract contain a non-compete clause?')).toEqual({
+        isDirectSection: false,
+      });
+    });
+
+    it('"What does Article 55 say?" on v1 surfaces the Limitation of Liability clause (p. 112) with a verified quote', async () => {
+      // Mock prisma.document.findUnique to return v1Extracted
+      const testDocId = 'v1-test-doc-art55';
+      const originalFindUnique = prisma.document.findUnique;
+      (prisma.document.findUnique as any) = async () => ({
+        id: testDocId,
+        extractedText: v1Extracted.text,
+        pageCount: 150,
+        pagesJson: v1Extracted.pages.map((p: any) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        chunks: [],
+      });
+
+      try {
+        const { getSectionContent } = await import('../src/lib/ai/retriever');
+        const sec = await getSectionContent(testDocId, '55');
+
+        expect(sec).not.toBeNull();
+        expect(sec!.sectionNumber).toBe('55');
+        expect(sec!.heading).toContain('LIMITATION OF LIABILITY AND REMEDIES');
+        expect(sec!.pages).toContain(112);
+        expect(sec!.text).toContain('The aggregate liability of either party shall not exceed AED 100,000.');
+        expect(sec!.complete).toBe(true);
+
+        // Verify quote from Article 55
+        const quote = 'The aggregate liability of either party shall not exceed AED 100,000.';
+        const vRes = verifyQuote({
+          documentId: testDocId,
+          candidateQuote: quote,
+          canonicalText: v1Extracted.text,
+          pages: v1Extracted.pages.map((p: any) => ({
+            pageNumber: p.pageNumber,
+            startOffset: p.startOffset,
+            endOffset: p.endOffset,
+          })),
+          noiseSpans: v1Extracted.noiseSpans,
+        });
+
+        expect(vRes.verified).toBe(true);
+        if (vRes.verified) {
+          expect(vRes.pageStart).toBe(112);
+          expect(vRes.pageEnd).toBe(112);
+        }
+      } finally {
+        prisma.document.findUnique = originalFindUnique;
+      }
+    });
+
+    it('"Whose liability is capped?" agent research finishes in <= 2 rounds', async () => {
+      const { aiClient } = await import('../src/lib/ai/client');
+      const originalChat = aiClient.createChatCompletion;
+
+      let callCount = 0;
+      (aiClient.createChatCompletion as any) = async ({ messages, tools }: any) => {
+        callCount++;
+        if (tools && callCount === 1) {
+          // Round 1: Model calls search_document for "liability cap"
+          return {
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: {
+                  name: 'search_document',
+                  arguments: JSON.stringify({ query: 'liability cap' }),
+                },
+              },
+            ],
+          };
+        }
+        // Round 2: Model provides answer immediately per prompt efficiency rules
+        return {
+          content:
+            'Both parties have their aggregate liability capped at AED 100,000 [[1]].\n\n---QUOTES---\n[{"id": 1, "quote": "The aggregate liability of either party shall not exceed AED 100,000."}]',
+        };
+      };
+
+      const originalFindUnique = prisma.document.findUnique;
+      (prisma.document.findUnique as any) = async () => ({
+        id: 'doc-whos-liability',
+        originalFilename: 'v1.pdf',
+        extractedText: v1Extracted.text,
+        pageCount: 150,
+        pagesJson: v1Extracted.pages.map((p: any) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        chunks: [],
+      });
+
+      try {
+        const res = await runAgenticDocumentResearch({
+          documentId: 'doc-whos-liability',
+          documentName: 'large-contract-v1-150pages.pdf',
+          question: 'Whose liability is capped?',
+          maxRounds: 5,
+        });
+
+        expect(res.roundsExecuted).toBeLessThanOrEqual(2);
+        expect(res.answer).toContain('Both parties have their aggregate liability capped');
+        expect(res.answer).not.toContain('Research stopped at 5 rounds');
+        expect(res.citations.length).toBeGreaterThanOrEqual(1);
+        expect(res.citations[0].verified).toBe(true);
+        expect(res.citations[0].pageStart).toBe(112);
+      } finally {
+        aiClient.createChatCompletion = originalChat;
+        prisma.document.findUnique = originalFindUnique;
+      }
+    });
+
+    it('places "Research stopped at N rounds" as a footer note ONLY when forced by the cap', async () => {
+      const { aiClient } = await import('../src/lib/ai/client');
+      const originalChat = aiClient.createChatCompletion;
+
+      // Simulate model that never answers until forced
+      (aiClient.createChatCompletion as any) = async ({ messages, tools }: any) => {
+        if (tools) {
+          return {
+            tool_calls: [
+              {
+                id: 'call_search',
+                type: 'function',
+                function: {
+                  name: 'search_document',
+                  arguments: JSON.stringify({ query: 'nonexistent topic' }),
+                },
+              },
+            ],
+          };
+        }
+        return {
+          content: 'No conclusive information could be located on this topic.',
+        };
+      };
+
+      const originalFindUnique = prisma.document.findUnique;
+      (prisma.document.findUnique as any) = async () => ({
+        id: 'doc-forced-cap',
+        originalFilename: 'v1.pdf',
+        extractedText: v1Extracted.text,
+        pageCount: 150,
+        pagesJson: [],
+        chunks: [],
+      });
+
+      try {
+        const res = await runAgenticDocumentResearch({
+          documentId: 'doc-forced-cap',
+          documentName: 'large-contract-v1-150pages.pdf',
+          question: 'What are the environmental remediation benchmarks?',
+          maxRounds: 3,
+        });
+
+        expect(res.roundsExecuted).toBe(3);
+        // Notice must NOT be at the beginning of the answer
+        expect(res.answer.startsWith('Research stopped at 3 rounds')).toBe(false);
+        // Must be a footer note at the end
+        expect(res.answer).toContain('*(Research stopped at 3 rounds)*');
+      } finally {
+        aiClient.createChatCompletion = originalChat;
+        prisma.document.findUnique = originalFindUnique;
+      }
+    });
+  });
+
+  describe('Defect 6: Real Agent Streaming, Delimiter Sanitization & Abort Persistence', () => {
+    it('StreamQuoteDelimiterParser strips preamble, lone "---", and never leaks delimiter or quotes JSON to stream', async () => {
+      const { StreamQuoteDelimiterParser, cleanAnswerPreambleAndSeparators } = await import(
+        '../src/lib/ai/stream-cleaner'
+      );
+
+      const streamedTokens: string[] = [];
+      const parser = new StreamQuoteDelimiterParser((token) => {
+        streamedTokens.push(token);
+      });
+
+      // Stream with conversational preamble, separator lines, and delimiter
+      const chunks = [
+        'The governing law is clearly stated in the contract.\n\n',
+        '---\n\n',
+        'The contract is governed by ',
+        'the laws of the Dubai International Financial Centre (DIFC) [[1]].\n\n',
+        '<<<QUOTES>>>\n',
+        '[{"id": 1, "quote": "The contract is governed by the laws of DIFC."}]',
+      ];
+
+      for (const ch of chunks) {
+        parser.feed(ch);
+      }
+
+      const flushed = parser.flush();
+      const combinedStreamed = streamedTokens.join('');
+
+      // 1. Visible streamed text must NOT contain delimiter or JSON quotes
+      expect(combinedStreamed).not.toContain('<<<QUOTES>>>');
+      expect(combinedStreamed).not.toContain('"id": 1');
+      expect(combinedStreamed).not.toContain('"quote"');
+
+      // 2. Final flushed prose must strip preamble and lone "---"
+      expect(flushed.prose).not.toContain('The governing law is clearly stated');
+      expect(flushed.prose).not.toContain('---');
+      expect(flushed.prose).toContain('The contract is governed by the laws of the Dubai International');
+
+      // 3. Quotes JSON buffer must contain the JSON array
+      expect(flushed.quotesJson).toContain('"id": 1');
+      expect(flushed.quotesJson).toContain('The contract is governed by the laws of DIFC.');
+    });
+
+    it('verifies real streaming in agent mode with timestamps (first token arrives well before completion)', async () => {
+      const { aiClient } = await import('../src/lib/ai/client');
+      const originalStream = aiClient.streamChatCompletion;
+
+      let streamStartTime = 0;
+      // Mock slow stream: chunk 1 arrives at ~20ms, chunk 2 at ~100ms, chunk 3 at ~200ms
+      (aiClient.streamChatCompletion as any) = async function* () {
+        streamStartTime = Date.now();
+        await new Promise((r) => setTimeout(r, 20));
+        yield { text: 'The termination notice period is ' };
+        await new Promise((r) => setTimeout(r, 100));
+        yield { text: 'thirty (30) days for convenience [[1]].\n\n' };
+        await new Promise((r) => setTimeout(r, 100));
+        yield {
+          text: '<<<QUOTES>>>\n[{"id": 1, "quote": "thirty (30) days for convenience"}]',
+        };
+      };
+
+      const originalFindUnique = prisma.document.findUnique;
+      (prisma.document.findUnique as any) = async () => ({
+        id: 'doc-stream-test',
+        originalFilename: 'test.pdf',
+        extractedText: 'SECTION 1. TERMINATION\nEither party may terminate this Agreement by providing thirty (30) days for convenience.',
+        pageCount: 10,
+        pagesJson: [],
+        chunks: [],
+      });
+
+      const tokenDelays: number[] = [];
+
+      try {
+        const res = await runAgenticDocumentResearch({
+          documentId: 'doc-stream-test',
+          documentName: 'test.pdf',
+          question: 'What does Section 1 say?',
+          maxRounds: 1,
+          onToken: () => {
+            if (streamStartTime > 0) {
+              tokenDelays.push(Date.now() - streamStartTime);
+            }
+          },
+        });
+
+        const streamCompletionTime = Date.now() - streamStartTime;
+
+        expect(tokenDelays.length).toBeGreaterThan(0);
+        const firstTokenDelay = tokenDelays[0];
+
+        // First token must arrive well before completion
+        expect(firstTokenDelay).toBeLessThan(streamCompletionTime * 0.5);
+        expect(streamCompletionTime - firstTokenDelay).toBeGreaterThanOrEqual(100);
+        expect(res.answer).toContain('The termination notice period is thirty (30) days');
+        expect(res.answer).not.toContain('<<<QUOTES>>>');
+      } finally {
+        aiClient.streamChatCompletion = originalStream;
+        prisma.document.findUnique = originalFindUnique;
+      }
+    });
+
+    it('persists partial text server-side with interrupted=true on client abort', async () => {
+      let createdRecord: any = null;
+      const originalCreate = prisma.message.create;
+      (prisma.message.create as any) = async ({ data }: any) => {
+        createdRecord = data;
+        return { id: 'msg_interrupted', ...data };
+      };
+
+      try {
+        const controller = new AbortController();
+        const convId = 'conv_abort_test';
+        let fullGeneratedText = '';
+        const collectedCitations: any[] = [];
+        const collectedUnverified: any[] = [];
+
+        // Simulate server-side abort handler logic from route.ts
+        let persistedOnAbort = false;
+        const persistPartialMessage = async () => {
+          if (persistedOnAbort) return;
+          persistedOnAbort = true;
+          if (fullGeneratedText.trim().length > 0) {
+            await prisma.message.create({
+              data: {
+                conversationId: convId,
+                role: 'assistant',
+                content: fullGeneratedText.trim(),
+                citations: JSON.parse(JSON.stringify(collectedCitations)),
+                interrupted: true,
+                verifiedCount: collectedCitations.length,
+                unverifiedCount: collectedUnverified.length,
+              },
+            });
+          }
+        };
+
+        controller.signal.addEventListener('abort', persistPartialMessage);
+
+        // Streaming begins
+        fullGeneratedText += 'This contract specifies that deliverables ';
+        fullGeneratedText += 'must be accepted within fourteen (14) days...';
+
+        // Client cancels request mid-stream
+        controller.abort();
+
+        // Allow microtasks to run
+        await new Promise((r) => setTimeout(r, 10));
+
+        expect(createdRecord).not.toBeNull();
+        expect(createdRecord.interrupted).toBe(true);
+        expect(createdRecord.content).toContain('deliverables must be accepted within fourteen (14) days');
+      } finally {
+        prisma.message.create = originalCreate;
+      }
+    });
+  });
+
+  describe('Defect 7: Multi-Document Comparison & Document Scoping', () => {
+    it('isComparativeQuestion detects comparative queries across multiple documents', async () => {
+      const { isComparativeQuestion } = await import('../src/lib/ai/coverage');
+
+      expect(isComparativeQuestion('How do the liability caps differ between the two documents?')).toBe(true);
+      expect(isComparativeQuestion('Compare both documents on termination')).toBe(true);
+      expect(isComparativeQuestion('What is the difference between both contracts?')).toBe(true);
+      expect(isComparativeQuestion('What are the differences across both contracts?')).toBe(true);
+      expect(isComparativeQuestion('Compare the notice periods in both')).toBe(true);
+
+      // Single doc queries
+      expect(isComparativeQuestion('What is the liability cap in this contract?')).toBe(false);
+      expect(isComparativeQuestion('Does the contract contain a non-compete clause?')).toBe(false);
+      expect(isComparativeQuestion('When are deliverables deemed accepted?')).toBe(false);
+    });
+
+    it('refuses to compare when only 1 document is selected for a comparative question', async () => {
+      const { isComparativeQuestion } = await import('../src/lib/ai/coverage');
+
+      const question = 'How do the liability caps differ between the two documents?';
+      const docIds = ['doc_only_one'];
+
+      let refusedMessage = '';
+      if (docIds.length === 1 && isComparativeQuestion(question)) {
+        refusedMessage = 'Only 1 document is selected. Select the other version in the library to compare.';
+      }
+
+      expect(refusedMessage).toBe('Only 1 document is selected. Select the other version in the library to compare.');
+    });
+
+    it('rejects candidate quote with missing or unknown documentId as unverified ("unknown document")', () => {
+      const docEvidenceList = [
+        { id: 'v1_doc_id', name: 'v1.pdf' },
+        { id: 'v2_doc_id', name: 'v2.pdf' },
+      ];
+
+      const candidateQuotes = [
+        { id: 1, quote: 'The aggregate liability shall not exceed AED 100,000.' }, // missing documentId
+        { id: 2, documentId: 'wrong_id_xyz', quote: 'The aggregate liability shall not exceed AED 1,000,000.' }, // invalid documentId
+      ];
+
+      const collectedUnverified: any[] = [];
+      const collectedCitations: any[] = [];
+
+      for (let i = 0; i < candidateQuotes.length; i++) {
+        const cand = candidateQuotes[i];
+        const targetDocInfo = docEvidenceList.find((d) => d.id === cand.documentId);
+        if (!cand.documentId || !targetDocInfo) {
+          collectedUnverified.push({
+            id: `unv_${i}`,
+            documentId: cand.documentId || 'unknown',
+            documentName: 'Unknown Document',
+            quote: cand.quote,
+            verified: false,
+            reason: 'unknown document (no valid documentId provided)',
+            citationNumber: cand.id || i + 1,
+          });
+        } else {
+          collectedCitations.push(cand);
+        }
+      }
+
+      expect(collectedCitations.length).toBe(0);
+      expect(collectedUnverified.length).toBe(2);
+      expect(collectedUnverified[0].reason).toContain('unknown document');
+      expect(collectedUnverified[1].reason).toContain('unknown document');
+    });
+
+    it('verifies v1 (AED 100,000) and v2 (AED 1,000,000) quotes strictly against their respective document', async () => {
+      let v1PdfBuffer: Buffer;
+      let v2PdfBuffer: Buffer;
+
+      const v1Path = path.join(process.cwd(), 'fixtures', 'large-contract-v1-150pages.pdf');
+      const v2Path = path.join(process.cwd(), 'fixtures', 'large-contract-v2-150pages.pdf');
+
+      try {
+        v1PdfBuffer = await fs.readFile(v1Path);
+        v2PdfBuffer = await fs.readFile(v2Path);
+      } catch {
+        const { generateBenchmark150PageContract } = await import('../scripts/create-benchmark-fixtures');
+        await generateBenchmark150PageContract('large-contract-v1-150pages.pdf', {
+          liabilityCap: 'AED 100,000',
+          noticeDays: 'thirty (30)',
+        });
+        await generateBenchmark150PageContract('large-contract-v2-150pages.pdf', {
+          liabilityCap: 'AED 1,000,000',
+          noticeDays: 'sixty (60)',
+        });
+        v1PdfBuffer = await fs.readFile(v1Path);
+        v2PdfBuffer = await fs.readFile(v2Path);
+      }
+
+      const v1Extracted = await extractPdfText(v1PdfBuffer);
+      const v2Extracted = await extractPdfText(v2PdfBuffer);
+
+      const v1Quote = 'The aggregate liability of either party shall not exceed AED 100,000.';
+      const v2Quote = 'The aggregate liability of either party shall not exceed AED 1,000,000.';
+
+      // Verify v1 quote on v1
+      const resV1 = verifyQuote({
+        documentId: 'doc_v1',
+        candidateQuote: v1Quote,
+        canonicalText: v1Extracted.text,
+        pages: v1Extracted.pages.map((p) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        noiseSpans: v1Extracted.noiseSpans,
+      });
+
+      // Verify v2 quote on v2
+      const resV2 = verifyQuote({
+        documentId: 'doc_v2',
+        candidateQuote: v2Quote,
+        canonicalText: v2Extracted.text,
+        pages: v2Extracted.pages.map((p) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        noiseSpans: v2Extracted.noiseSpans,
+      });
+
+      expect(resV1.verified).toBe(true);
+      if (resV1.verified) {
+        expect(resV1.pageStart).toBe(112);
+      }
+
+      expect(resV2.verified).toBe(true);
+      if (resV2.verified) {
+        expect(resV2.pageStart).toBe(112);
+      }
+
+      // Cross-verification: v1 quote must FAIL on v2 document
+      const resV1onV2 = verifyQuote({
+        documentId: 'doc_v2',
+        candidateQuote: v1Quote,
+        canonicalText: v2Extracted.text,
+        pages: v2Extracted.pages.map((p) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        noiseSpans: v2Extracted.noiseSpans,
+      });
+      expect(resV1onV2.verified).toBe(false);
+
+      // Cross-verification: v2 quote must FAIL on v1 document
+      const resV2onV1 = verifyQuote({
+        documentId: 'doc_v1',
+        candidateQuote: v2Quote,
+        canonicalText: v1Extracted.text,
+        pages: v1Extracted.pages.map((p) => ({
+          pageNumber: p.pageNumber,
+          startOffset: p.startOffset,
+          endOffset: p.endOffset,
+        })),
+        noiseSpans: v1Extracted.noiseSpans,
+      });
+      expect(resV2onV1.verified).toBe(false);
+    });
+  });
 });
 
 

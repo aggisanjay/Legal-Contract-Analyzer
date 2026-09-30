@@ -84,3 +84,55 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Failed to retrieve chat history' }, { status: 500 });
   }
 }
+
+export async function DELETE(req: NextRequest) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const conversationId = searchParams.get('conversationId');
+    const documentId = searchParams.get('documentId');
+    const deleteAll = searchParams.get('all') === 'true';
+
+    // Case 1: Delete a specific conversation by ID
+    if (conversationId) {
+      await prisma.conversation.delete({
+        where: { id: conversationId },
+      });
+      return NextResponse.json({ success: true, deletedConversationId: conversationId });
+    }
+
+    // Case 2: Delete all conversations for a document
+    if (documentId && deleteAll) {
+      const deleteResult = await prisma.conversation.deleteMany({
+        where: { documentId },
+      });
+      return NextResponse.json({ success: true, count: deleteResult.count });
+    }
+
+    // Also support JSON body
+    try {
+      const body = await req.json();
+      if (body?.conversationId) {
+        await prisma.conversation.delete({
+          where: { id: body.conversationId },
+        });
+        return NextResponse.json({ success: true, deletedConversationId: body.conversationId });
+      }
+      if (body?.documentId && body?.all) {
+        const deleteResult = await prisma.conversation.deleteMany({
+          where: { documentId: body.documentId },
+        });
+        return NextResponse.json({ success: true, count: deleteResult.count });
+      }
+    } catch {
+      // Body was empty or not JSON, continue
+    }
+
+    return NextResponse.json(
+      { error: 'conversationId or documentId with all=true is required' },
+      { status: 400 }
+    );
+  } catch (err: unknown) {
+    console.error('Failed to delete conversation history:', err);
+    return NextResponse.json({ error: 'Failed to delete conversation history' }, { status: 500 });
+  }
+}

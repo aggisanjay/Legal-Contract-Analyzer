@@ -30,6 +30,17 @@ body {
   background: #94a3b8;
 }
 
+/* Hide Scrollbar Utility */
+.no-scrollbar::-webkit-scrollbar {
+  display: none !important;
+  width: 0px !important;
+  height: 0px !important;
+}
+.no-scrollbar {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}
+
 /* PDF.js Text Layer and Highlighting */
 .textLayer {
   position: absolute;
@@ -39,10 +50,12 @@ body {
   right: 0;
   bottom: 0;
   overflow: hidden;
-  opacity: 0.25;
+  opacity: 1;
   line-height: 1;
   user-select: text;
+  -webkit-user-select: text;
   pointer-events: auto;
+  z-index: 5;
 }
 
 .textLayer span {
@@ -51,6 +64,21 @@ body {
   white-space: pre;
   cursor: text;
   transform-origin: 0% 0%;
+}
+
+.textLayer ::selection {
+  background: rgba(37, 99, 235, 0.35);
+  color: transparent;
+}
+
+.textLayer ::-moz-selection {
+  background: rgba(37, 99, 235, 0.35);
+  color: transparent;
+}
+
+.textLayer br::selection,
+.textLayer br::-moz-selection {
+  background: transparent;
 }
 
 /* Citation Highlight Pulse Effect */

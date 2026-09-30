@@ -4,6 +4,7 @@ import { aiClient, AIUnavailableError } from '@/lib/ai/client';
 import { retrieveChunksForDocument } from '@/lib/ai/retriever';
 import {
   isExhaustiveQuestion,
+  isComparativeQuestion,
   executeTargetedRetrieval,
   executeMapReduceRetrieval,
   enforceAbsenceCoverage,
@@ -15,6 +16,12 @@ import { isAbsenceClaim } from '@/lib/ai/coverage';
 import { VerifiedCitation } from '@/lib/types';
 import { deduplicateVerifiedCitations, normalizeQuoteForDedup } from '@/lib/utils/format';
 import { checkQuoteSupport, sanitizeProcessDescriptions } from '@/lib/quotes/quote-support';
+import {
+  StreamQuoteDelimiterParser,
+  cleanAnswerPreambleAndSeparators,
+  MACHINE_DELIMITER,
+  LEGACY_DELIMITER,
+} from '@/lib/ai/stream-cleaner';
 
 export const dynamic = 'force-dynamic';
 
@@ -46,6 +53,8 @@ export async function POST(req: NextRequest) {
     if (docIds.length === 0) {
       return new Response('At least one document ID is required', { status: 400 });
     }
+
+    console.log(`[Chat Stream API] Received ${docIds.length} document ID(s):`, docIds);
 
     // Find or create conversation
     let convId = existingConvId;
@@ -99,6 +108,24 @@ export async function POST(req: NextRequest) {
         // Emit meta event first containing conversationId (assignment requirement)
         sendEvent('meta', { conversationId: convId });
 
+        // Guard: If question asks to compare / mentions two documents but only 1 is selected, refuse to answer
+        if (docIds.length === 1 && isComparativeQuestion(question)) {
+          const refusal = 'Only 1 document is selected. Select the other version in the library to compare.';
+          sendEvent('token', { text: refusal });
+          await prisma.message.create({
+            data: {
+              conversationId: convId,
+              role: 'assistant',
+              content: refusal,
+              verifiedCount: 0,
+              unverifiedCount: 0,
+            },
+          });
+          sendEvent('done', {});
+          controller.close();
+          return;
+        }
+
         // Server-side stop handler: listen to abort signal and persist partial message
         let persistedOnAbort = false;
         const persistPartialMessage = async () => {
@@ -134,11 +161,15 @@ export async function POST(req: NextRequest) {
               select: { originalFilename: true, pageCount: true },
             });
 
+            const streamStart = Date.now();
+            let firstTokenTime: number | null = null;
+
             const agentRes = await runAgenticDocumentResearch({
               documentId: docIds[0],
               documentName: doc?.originalFilename || 'contract.pdf',
               pageCount: doc?.pageCount,
               question,
+              signal: req.signal,
               onProgress: (progress) => {
                 sendEvent('status', {
                   message: progress.message,
@@ -147,14 +178,28 @@ export async function POST(req: NextRequest) {
                   toolCall: progress.toolCall,
                 });
               },
+              onToken: (token) => {
+                if (!firstTokenTime) {
+                  firstTokenTime = Date.now();
+                  console.log(`[Agent Stream] First token arrived after ${firstTokenTime - streamStart}ms`);
+                }
+                fullGeneratedText += token;
+                sendEvent('token', { text: token });
+              },
             });
+
+            const completionTime = Date.now();
+            console.log(
+              `[Agent Stream] Completed in ${completionTime - streamStart}ms (first token arrived at ${
+                firstTokenTime ? firstTokenTime - streamStart : 0
+              }ms)`
+            );
 
             // Emit REAL coverage from the agent (deleted hardcoded coverage object)
             sendEvent('coverage', agentRes.coverage);
 
-            // Stream answer tokens directly
+            // Ensure fullGeneratedText matches final sanitized answer
             fullGeneratedText = agentRes.answer;
-            sendEvent('token', { text: agentRes.answer });
 
             for (const cit of agentRes.citations) {
               if (cit.verified) {
@@ -210,10 +255,18 @@ export async function POST(req: NextRequest) {
 
             sendEvent('status', { message: 'Analyzing substantive differences across contracts...' });
 
-            const DELIMITER = '---QUOTES---';
-            let passedDelimiter = false;
-            let currentLineBuffer = '';
+            const streamStart = Date.now();
+            let firstTokenTime: number | null = null;
             let quotesJsonBuffer = '';
+
+            const parser = new StreamQuoteDelimiterParser((token) => {
+              if (!firstTokenTime) {
+                firstTokenTime = Date.now();
+                console.log(`[MultiDoc Stream] First token arrived after ${firstTokenTime - streamStart}ms`);
+              }
+              fullGeneratedText += token;
+              sendEvent('token', { text: token });
+            });
 
             const streamGen = aiClient.streamChatCompletion({
               messages: promptMessages,
@@ -226,47 +279,19 @@ export async function POST(req: NextRequest) {
 
             for await (const chunk of streamGen) {
               if (req.signal.aborted) break;
-
-              const text = chunk.text;
-              if (passedDelimiter) {
-                quotesJsonBuffer += text;
-                continue;
-              }
-
-              currentLineBuffer += text;
-              const delimIdx = currentLineBuffer.indexOf(DELIMITER);
-              if (delimIdx !== -1) {
-                passedDelimiter = true;
-                const proseBefore = currentLineBuffer.slice(0, delimIdx);
-                if (proseBefore.length > 0) {
-                  fullGeneratedText += proseBefore;
-                  sendEvent('token', { text: proseBefore });
-                }
-                quotesJsonBuffer = currentLineBuffer.slice(delimIdx + DELIMITER.length);
-                currentLineBuffer = '';
-                continue;
-              }
-
-              const potentialPrefixMatch = currentLineBuffer.match(/(\r?\n-[-A-Z]*)$/);
-              if (potentialPrefixMatch) {
-                const safeLength = currentLineBuffer.length - potentialPrefixMatch[0].length;
-                if (safeLength > 0) {
-                  const safeText = currentLineBuffer.slice(0, safeLength);
-                  fullGeneratedText += safeText;
-                  sendEvent('token', { text: safeText });
-                  currentLineBuffer = currentLineBuffer.slice(safeLength);
-                }
-              } else {
-                fullGeneratedText += currentLineBuffer;
-                sendEvent('token', { text: currentLineBuffer });
-                currentLineBuffer = '';
-              }
+              parser.feed(chunk.text);
             }
 
-            if (!passedDelimiter && currentLineBuffer.length > 0) {
-              fullGeneratedText += currentLineBuffer;
-              sendEvent('token', { text: currentLineBuffer });
-            }
+            const flushed = parser.flush();
+            fullGeneratedText = flushed.prose;
+            quotesJsonBuffer = flushed.quotesJson;
+
+            const completionTime = Date.now();
+            console.log(
+              `[MultiDoc Stream] Completed in ${completionTime - streamStart}ms (first token arrived at ${
+                firstTokenTime ? firstTokenTime - streamStart : 0
+              }ms)`
+            );
 
             // Verify candidate quotes for multi-document mode
             sendEvent('status', { message: 'Verifying quotations against each contract...' });
@@ -430,10 +455,18 @@ export async function POST(req: NextRequest) {
                 },
               ];
 
-              const DELIMITER = '---QUOTES---';
-              let passedDelimiter = false;
-              let currentLineBuffer = '';
+              const streamStart = Date.now();
+              let firstTokenTime: number | null = null;
               let quotesJsonBuffer = '';
+
+              const parser = new StreamQuoteDelimiterParser((token) => {
+                if (!firstTokenTime) {
+                  firstTokenTime = Date.now();
+                  console.log(`[SingleDoc Stream] First token arrived after ${firstTokenTime - streamStart}ms`);
+                }
+                fullGeneratedText += token;
+                sendEvent('token', { text: token });
+              });
 
               const streamGen = aiClient.streamChatCompletion({
                 messages: promptMessages,
@@ -446,47 +479,19 @@ export async function POST(req: NextRequest) {
 
               for await (const chunk of streamGen) {
                 if (req.signal.aborted) break;
-
-                const text = chunk.text;
-                if (passedDelimiter) {
-                  quotesJsonBuffer += text;
-                  continue;
-                }
-
-                currentLineBuffer += text;
-                const delimIdx = currentLineBuffer.indexOf(DELIMITER);
-                if (delimIdx !== -1) {
-                  passedDelimiter = true;
-                  const proseBefore = currentLineBuffer.slice(0, delimIdx);
-                  if (proseBefore.length > 0) {
-                    fullGeneratedText += proseBefore;
-                    sendEvent('token', { text: proseBefore });
-                  }
-                  quotesJsonBuffer = currentLineBuffer.slice(delimIdx + DELIMITER.length);
-                  currentLineBuffer = '';
-                  continue;
-                }
-
-                const potentialPrefixMatch = currentLineBuffer.match(/(\r?\n-[-A-Z]*)$/);
-                if (potentialPrefixMatch) {
-                  const safeLength = currentLineBuffer.length - potentialPrefixMatch[0].length;
-                  if (safeLength > 0) {
-                    const safeText = currentLineBuffer.slice(0, safeLength);
-                    fullGeneratedText += safeText;
-                    sendEvent('token', { text: safeText });
-                    currentLineBuffer = currentLineBuffer.slice(safeLength);
-                  }
-                } else {
-                  fullGeneratedText += currentLineBuffer;
-                  sendEvent('token', { text: currentLineBuffer });
-                  currentLineBuffer = '';
-                }
+                parser.feed(chunk.text);
               }
 
-              if (!passedDelimiter && currentLineBuffer.length > 0) {
-                fullGeneratedText += currentLineBuffer;
-                sendEvent('token', { text: currentLineBuffer });
-              }
+              const flushed = parser.flush();
+              fullGeneratedText = flushed.prose;
+              quotesJsonBuffer = flushed.quotesJson;
+
+              const completionTime = Date.now();
+              console.log(
+                `[SingleDoc Stream] Completed in ${completionTime - streamStart}ms (first token arrived at ${
+                  firstTokenTime ? firstTokenTime - streamStart : 0
+                }ms)`
+              );
 
               // Verify quotations
               sendEvent('status', { message: 'Verifying quotations...' });

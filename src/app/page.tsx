@@ -8,7 +8,7 @@ import { ChatPanel } from '@/components/ChatPanel';
 import { UploadModal } from '@/components/UploadModal';
 import { ComparisonModal } from '@/components/ComparisonModal';
 import { DocumentMetadata, VerifiedCitation } from '@/lib/types';
-import { Layers, FileText, MessageSquare } from 'lucide-react';
+import { Layers, FileText, MessageSquare, PanelLeft, PanelRight } from 'lucide-react';
 
 export default function Home() {
   const [documents, setDocuments] = useState<DocumentMetadata[]>([]);
@@ -19,6 +19,10 @@ export default function Home() {
 
   // Responsive mobile/tablet active tab (< 1024px)
   const [mobileTab, setMobileTab] = useState<'library' | 'viewer' | 'chat'>('viewer');
+
+  // Desktop panel visibility toggles (default both open)
+  const [isLibraryOpen, setIsLibraryOpen] = useState<boolean>(true);
+  const [isChatOpen, setIsChatOpen] = useState<boolean>(true);
 
   // Agentic Research (Part C) Mode Toggle
   const [useAgent, setUseAgent] = useState<boolean>(true);
@@ -115,6 +119,10 @@ export default function Home() {
         selectedCount={selectedDocumentIds.length}
         useAgent={useAgent}
         onToggleAgent={setUseAgent}
+        isLibraryOpen={isLibraryOpen}
+        onToggleLibrary={() => setIsLibraryOpen((prev) => !prev)}
+        isChatOpen={isChatOpen}
+        onToggleChat={() => setIsChatOpen((prev) => !prev)}
       />
 
       {/* Mobile/Tablet Sub-Navigation (< 1024px) */}
@@ -159,10 +167,14 @@ export default function Home() {
         </button>
       </div>
 
-      {/* Main 3-Column Workspace */}
-      <main className="flex-1 flex overflow-hidden">
-        {/* Left: Document Library */}
-        <div className={`h-full ${mobileTab === 'library' ? 'flex flex-1' : 'hidden'} lg:flex shrink-0`}>
+      {/* Main 3-Column Workspace: Left (Library) | Middle (Viewer) | Right (Assistant) */}
+      <main className="flex-1 min-h-0 flex w-full overflow-hidden relative">
+        {/* Left Column: Contract Document Library */}
+        <div
+          className={`h-full shrink-0 ${
+            mobileTab === 'library' ? 'flex w-full' : 'hidden'
+          } ${isLibraryOpen ? 'lg:flex lg:w-64 xl:w-72' : 'lg:hidden'}`}
+        >
           <DocumentLibrary
             documents={documents}
             activeDocumentId={activeDocumentId}
@@ -175,8 +187,37 @@ export default function Home() {
           />
         </div>
 
-        {/* Center: Document Viewer (PDF.js + Highlighting + Multi-doc Tabs) */}
-        <div className={`h-full flex-1 ${mobileTab === 'viewer' ? 'flex' : 'hidden'} lg:flex`}>
+        {/* Middle Column: Document Viewer (PDF.js + Exact Highlighting + Multi-doc Tabs) */}
+        <div
+          className={`h-full flex-1 min-w-0 flex flex-col overflow-hidden relative ${
+            mobileTab === 'viewer' ? 'flex' : 'hidden'
+          } lg:flex`}
+        >
+          {/* Quick Floating Re-expand Buttons when panels are collapsed on desktop */}
+          {!isLibraryOpen && (
+            <button
+              type="button"
+              onClick={() => setIsLibraryOpen(true)}
+              className="hidden lg:flex absolute top-3 left-3 z-30 px-2.5 py-1.5 rounded-lg bg-white/95 hover:bg-white text-slate-700 hover:text-blue-600 border border-slate-300 shadow-md backdrop-blur transition-all items-center gap-1.5 text-xs font-semibold"
+              title="Expand Contract Library (Left Panel)"
+            >
+              <PanelLeft className="w-3.5 h-3.5 text-blue-600" />
+              <span>Library</span>
+            </button>
+          )}
+
+          {!isChatOpen && (
+            <button
+              type="button"
+              onClick={() => setIsChatOpen(true)}
+              className="hidden lg:flex absolute top-3 right-3 z-30 px-2.5 py-1.5 rounded-lg bg-white/95 hover:bg-white text-slate-700 hover:text-blue-600 border border-slate-300 shadow-md backdrop-blur transition-all items-center gap-1.5 text-xs font-semibold"
+              title="Expand AI Assistant (Right Panel)"
+            >
+              <PanelRight className="w-3.5 h-3.5 text-blue-600" />
+              <span>Assistant</span>
+            </button>
+          )}
+
           <DocumentViewer
             document={activeDocument}
             activeCitation={activeCitation}
@@ -186,8 +227,12 @@ export default function Home() {
           />
         </div>
 
-        {/* Right: AI Assistant Chat */}
-        <div className={`h-full ${mobileTab === 'chat' ? 'flex flex-1' : 'hidden'} lg:flex shrink-0`}>
+        {/* Right Column: AI Assistant Chat & Citations */}
+        <div
+          className={`h-full shrink-0 ${
+            mobileTab === 'chat' ? 'flex w-full' : 'hidden'
+          } ${isChatOpen ? 'lg:flex lg:w-[350px] xl:w-[390px]' : 'lg:hidden'}`}
+        >
           <ChatPanel
             activeDocument={activeDocument}
             selectedDocuments={selectedDocuments}

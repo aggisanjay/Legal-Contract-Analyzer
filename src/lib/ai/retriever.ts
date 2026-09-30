@@ -108,6 +108,29 @@ export interface SectionContentResult {
 }
 
 /**
+ * Detects direct section questions like "What does Article 55 say?", "What does Clause 14 state?", "Article 55"
+ */
+export function detectDirectSectionQuestion(question: string): { isDirectSection: boolean; sectionNumber?: string } {
+  const q = question.trim();
+  // 1. "What does Article/Clause/Section 55 say/state/provide/mean/contain/cover...?"
+  let match = q.match(/what\s+does\s+(?:article|clause|section)\s+([0-9]+(?:\.[0-9]+)?)/i);
+  if (match && match[1]) {
+    return { isDirectSection: true, sectionNumber: match[1] };
+  }
+  // 2. "What is in Article/Clause/Section 55...?" or "Summarize Article 55..." or "Explain Article 55..."
+  match = q.match(/(?:what\s+is\s+(?:in\s+)?|summarize\s+|explain\s+)(?:article|clause|section)\s+([0-9]+(?:\.[0-9]+)?)/i);
+  if (match && match[1]) {
+    return { isDirectSection: true, sectionNumber: match[1] };
+  }
+  // 3. Standalone "Article 55", "Clause 14", "Section 3.1"
+  match = q.match(/^(?:article|clause|section)\s+([0-9]+(?:\.[0-9]+)?)\??$/i);
+  if (match && match[1]) {
+    return { isDirectSection: true, sectionNumber: match[1] };
+  }
+  return { isDirectSection: false };
+}
+
+/**
  * Retrieves a specific section by sectionNumber (e.g. "12", "14.2", "Clause 14", "Article 55").
  * Delimited by the next "Article N." / "N." heading, including clauses inside the article.
  */
@@ -118,6 +141,8 @@ export async function getSectionContent(
   limit: number = 15000
 ): Promise<SectionContentResult | null> {
   const cleanNumber = sectionNumber.replace(/^(?:section|clause|article)\s*/i, '').trim();
+  const numMatch = cleanNumber.match(/^(\d+(?:\.\d+)?)/);
+  const pureNumber = numMatch ? numMatch[1] : cleanNumber;
 
   // Try extracting directly from canonical extractedText if available
   try {
@@ -136,56 +161,104 @@ export async function getSectionContent(
     if (doc?.extractedText) {
       const fullText = doc.extractedText;
       // Regex for this section heading: e.g. "ARTICLE 55" or "Section 55" or "55."
-      const escapedNum = cleanNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const escapedNum = pureNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const startRegex = new RegExp(
         `(?:^|\\n)(?:(?:ARTICLE|Article|SECTION|Section|CLAUSE|Clause)\\s+)?${escapedNum}[.:\\s]+([^\\n\\r]*)`,
-        'i'
+        'gi'
       );
 
-      const startMatch = startRegex.exec(fullText);
-      if (startMatch) {
-        const sectionStart = startMatch.index;
-        const heading = startMatch[1]?.trim() || '';
+      const matches: Array<{ start: number; heading: string; rawHeading: string }> = [];
+      let m: RegExpExecArray | null;
+      while ((m = startRegex.exec(fullText)) !== null) {
+        matches.push({
+          start: m.index,
+          heading: m[1]?.trim() || '',
+          rawHeading: m[0],
+        });
+      }
 
-        // Delimit by the next "Article N." or next major section heading
-        const isArticle = /^article\b/i.test(sectionNumber) || /article/i.test(startMatch[0]);
-        let endRegex: RegExp;
-        if (isArticle) {
-          endRegex = /(?:^|\n)(?:ARTICLE|Article)\s+[0-9]+/gi;
-        } else {
-          endRegex = /(?:^|\n)(?:(?:SECTION|Section|CLAUSE|Clause|ARTICLE|Article)\s+[0-9]+|[0-9]{1,3}\.)\s+[^\n\r]+/gi;
-        }
-
-        endRegex.lastIndex = sectionStart + startMatch[0].length;
-        const nextMatch = endRegex.exec(fullText);
-        const sectionEnd = nextMatch ? nextMatch.index : fullText.length;
-
-        const totalSectionLength = sectionEnd - sectionStart;
-        const actualStart = sectionStart + offset;
-        const actualEnd = Math.min(actualStart + limit, sectionEnd);
-        const sectionText = fullText.slice(actualStart, actualEnd).trim();
-        const complete = actualEnd >= sectionEnd;
-        const nextOffset = complete ? undefined : offset + limit;
-
-        // Find covered pages and chunks
+      if (matches.length > 0) {
+        const isArticle = /^article\b/i.test(sectionNumber) || matches.some((match) => /article/i.test(match.rawHeading));
+        const segments: Array<{ text: string; heading: string; start: number; end: number }> = [];
         const coveredPages = new Set<number>();
         const coveredChunkIds: string[] = [];
 
-        for (const c of doc.chunks) {
-          if (c.endOffset >= actualStart && c.startOffset <= actualEnd) {
-            coveredChunkIds.push(c.id);
-            for (let p = c.pageStart; p <= c.pageEnd; p++) {
-              coveredPages.add(p);
+        for (const match of matches) {
+          const sectionStart = match.start;
+          let sectionEnd = fullText.length;
+
+          if (isArticle) {
+            const nextArticleRegex = /(?:^|\n)(?:ARTICLE|Article)\s+(\d+)/gi;
+            nextArticleRegex.lastIndex = sectionStart + match.rawHeading.length;
+            let nextArtMatch: RegExpExecArray | null;
+            while ((nextArtMatch = nextArticleRegex.exec(fullText)) !== null) {
+              if (nextArtMatch[1] !== pureNumber) {
+                sectionEnd = nextArtMatch.index;
+                break;
+              }
+            }
+          } else {
+            const nextSectionRegex = /(?:^|\n)(?:(?:SECTION|Section|CLAUSE|Clause|ARTICLE|Article)\s+(\d+(?:\.\d+)?)|(\d+)\.\s+[A-Z])/gi;
+            nextSectionRegex.lastIndex = sectionStart + match.rawHeading.length;
+            let nextSecMatch: RegExpExecArray | null;
+            while ((nextSecMatch = nextSectionRegex.exec(fullText)) !== null) {
+              const foundNum = nextSecMatch[1] || nextSecMatch[2];
+              if (foundNum && foundNum !== pureNumber && !foundNum.startsWith(pureNumber + '.')) {
+                sectionEnd = nextSecMatch.index;
+                break;
+              }
+            }
+          }
+
+          const segText = fullText.slice(sectionStart, sectionEnd).trim();
+          segments.push({
+            text: segText,
+            heading: match.heading,
+            start: sectionStart,
+            end: sectionEnd,
+          });
+
+          if (Array.isArray(doc.pagesJson)) {
+            for (const p of doc.pagesJson as Array<{ pageNumber: number; startOffset: number; endOffset: number }>) {
+              if (p.endOffset >= sectionStart && p.startOffset <= sectionEnd) {
+                coveredPages.add(p.pageNumber);
+              }
+            }
+          }
+
+          for (const c of doc.chunks) {
+            if (c.endOffset >= sectionStart && c.startOffset <= sectionEnd) {
+              coveredChunkIds.push(c.id);
+              for (let p = c.pageStart; p <= c.pageEnd; p++) {
+                coveredPages.add(p);
+              }
             }
           }
         }
+
+        // Prioritize substantive headings (e.g. Limitation of Liability, Termination, Confidentiality)
+        const substantiveSegment = segments.find((s) =>
+          /liabilit|remed|terminat|indemn|confidential/i.test(s.heading)
+        );
+        const heading = substantiveSegment?.heading || segments[0].heading;
+
+        // If multiple occurrences exist, combine them so all clauses (including p. 112) are present
+        const combinedText = segments.map((s) => s.text).join('\n\n');
+        const sectionStart = segments[0].start;
+        const sectionEnd = segments[segments.length - 1].end;
+
+        const actualStart = offset;
+        const actualEnd = Math.min(actualStart + limit, combinedText.length);
+        const sectionText = combinedText.slice(actualStart, actualEnd).trim();
+        const complete = actualEnd >= combinedText.length;
+        const nextOffset = complete ? undefined : offset + limit;
 
         const pagesList = Array.from(coveredPages).sort((a, b) => a - b);
         const pageStart = pagesList[0] || 1;
         const pageEnd = pagesList[pagesList.length - 1] || pageStart;
 
         return {
-          sectionNumber: cleanNumber,
+          sectionNumber: pureNumber,
           heading,
           text: sectionText,
           pageStart,

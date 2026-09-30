@@ -52,10 +52,20 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const [totalPages, setTotalPages] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [inputPageNumber, setInputPageNumber] = useState<string>('1');
-  const [scale, setScale] = useState<number>(1.2);
+  const [scale, setScale] = useState<number>(1.05);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [visiblePages, setVisiblePages] = useState<Set<number>>(new Set([1, 2]));
+
+  // Auto-fit document to width of the middle viewer container
+  const handleFitWidth = useCallback(() => {
+    if (!containerRef.current) return;
+    const availableWidth = containerRef.current.clientWidth - 48;
+    if (availableWidth > 200) {
+      const target = Math.min(2.0, Math.max(0.6, availableWidth / 612));
+      setScale(Number(target.toFixed(2)));
+    }
+  }, []);
 
   // DOCX State
   const isDocx = useMemo(() => {
@@ -208,6 +218,12 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
         canvas.height = viewport.height;
         canvas.width = viewport.width;
+
+        const wrapper = window.document.getElementById(`page-wrapper-${pageNum}`);
+        if (wrapper) {
+          wrapper.style.width = `${viewport.width}px`;
+          wrapper.style.minHeight = `${viewport.height}px`;
+        }
 
         // Render Canvas
         await page.render({
@@ -561,7 +577,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   if (!document) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center bg-slate-100/60 p-8 text-center">
+      <div className="flex-1 w-full h-full min-w-0 flex flex-col items-center justify-center bg-slate-100/60 p-8 text-center">
         <div className="w-16 h-16 rounded-2xl bg-white border border-slate-200 shadow-xs flex items-center justify-center text-slate-400 mb-4">
           <FileText className="w-8 h-8 stroke-[1.5]" />
         </div>
@@ -575,7 +591,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   if (document.status === 'PROCESSING' || document.status === 'UPLOADING') {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center bg-slate-100/60 p-8 text-center">
+      <div className="flex-1 w-full h-full min-w-0 flex flex-col items-center justify-center bg-slate-100/60 p-8 text-center">
         <Loader2 className="w-10 h-10 animate-spin text-blue-600 mb-4" />
         <h3 className="text-sm font-semibold text-slate-800 mb-1">Processing Contract</h3>
         <p className="text-xs text-slate-500 max-w-sm mb-2">
@@ -590,7 +606,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
 
   if (document.status === 'FAILED') {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center bg-slate-100/60 p-8 text-center">
+      <div className="flex-1 w-full h-full min-w-0 flex flex-col items-center justify-center bg-slate-100/60 p-8 text-center">
         <div className="w-12 h-12 rounded-2xl bg-rose-50 border border-rose-200 text-rose-600 flex items-center justify-center mb-4">
           <AlertTriangle className="w-6 h-6" />
         </div>
@@ -618,7 +634,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-slate-200/70 overflow-hidden relative">
+    <div className="flex-1 w-full h-full min-w-0 flex flex-col bg-slate-200/70 overflow-hidden relative">
       {/* Top Document Tabs (When multiple documents are selected) */}
       {selectedDocuments.length > 1 && (
         <div className="bg-slate-100 border-b border-slate-300 px-3 pt-2 flex items-center gap-1 overflow-x-auto shrink-0 z-20">
@@ -645,7 +661,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       )}
 
       {/* Main Toolbar */}
-      <div className="h-12 border-b border-slate-300 bg-white/95 backdrop-blur px-4 flex items-center justify-between shrink-0 shadow-2xs z-20">
+      <div className="h-12 border-b border-slate-300 bg-white/95 backdrop-blur px-3 md:px-4 flex items-center justify-between shrink-0 shadow-2xs z-20 min-w-0 w-full gap-2">
         {/* Document Info */}
         <div className="flex items-center gap-2 min-w-0">
           <FileText className="w-4 h-4 text-blue-600 shrink-0" />
@@ -748,9 +764,9 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => setScale(1.2)}
+                onClick={handleFitWidth}
                 className="p-1 text-slate-600 hover:text-slate-900 transition-colors border-l border-slate-200 ml-0.5"
-                title="Reset Zoom"
+                title="Fit to Width"
               >
                 <Maximize2 className="w-3.5 h-3.5" />
               </button>
@@ -787,7 +803,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
       {/* Document View Content Area */}
       <div
         ref={containerRef}
-        className="flex-1 overflow-y-auto p-6 flex flex-col items-center gap-6"
+        className="flex-1 w-full min-w-0 overflow-y-auto overflow-x-auto p-4 md:p-6 flex flex-col items-center gap-6"
       >
         {/* Loading state */}
         {(isLoading || isLoadingDocx) && (
@@ -823,7 +839,7 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
                 id={`page-wrapper-${pageNum}`}
                 data-page-number={pageNum}
                 className="page-placeholder relative bg-white shadow-xl rounded-md overflow-hidden transition-shadow hover:shadow-2xl min-h-[500px]"
-                style={{ width: `${600 * scale}px` }}
+                style={{ width: `${612 * scale}px`, maxWidth: '100%' }}
               >
                 {/* Page number watermark */}
                 <div className="absolute top-2 right-2 px-1.5 py-0.5 rounded bg-slate-800/60 text-white text-[10px] font-mono select-none z-10">

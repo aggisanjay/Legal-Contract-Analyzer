@@ -161,16 +161,14 @@ Configure your environment variables in `.env`:
 
 | Feature / Requirement | Status | Verification & Notes |
 | :--- | :---: | :--- |
-| **Quote Verifier Offset Bug Fix** | **Finished** | Ligature expansion 1:1 map, soft hyphens, hyphenated line breaks, min length guard, real `pagesJson` offsets. Verified by Vitest. |
-| **True Provider Streaming + Stop** | **Finished** | Provider SSE with `---QUOTES---` delimiter. Server-side abort signal persists partial answer with `interrupted: true`. First event is `meta`. |
-| **Zero Fake AI Fallbacks** | **Finished** | Simulated engines completely removed. Typed `AIUnavailableError` thrown when unavailable. Primary generic `AI_API_KEY`/`AI_BASE_URL`/`AI_MODEL` supported. |
-| **Unverified Citation Handling** | **Finished** | Candidate quotes verified server-side; unverified grouped separately in collapsed warning section, non-clickable. Zero verified quotes notice rendered. Multi-doc verifies only against own document. |
-| **150-Page Support & Coverage Honesty** | **Finished** | Strategy A (Targeted hybrid) and Strategy B (Map-reduce over chunks). Enforced coverage honesty: never claims absence if coverage < 100%. Tested with 150-page fixture. |
-| **Upload Pipeline with Real Status** | **Finished** | Immediate 202/PROCESSING return, background stage progression, magic byte validation, scanned PDF rejection, database storage interface. |
-| **Part C: Agentic Research Hardening** | **Finished** | Hard round cap, structured tool error recovery, character budget guard, multi-doc tool execution, live step timeline. |
-| **Semantic Comparison Quality** | **Finished** | Section/paragraph alignment, Jaccard similarity for renumbered clauses, deterministic significance guard (currency/dates/modals never LOW), inline word LCS diff. |
-| **Chat History Drawer** | **Finished** | List conversations per document (including multi-doc), reopen past conversations with interactive citations intact. |
-| **Citation Highlighting in Viewer** | **Finished** | Text-layer search matching verifier normalization, multi-line line rects, duplicate occurrence navigation ("Occurrence 1 of N"), DOCX HTML viewer, fallback toast. |
+| **Defect 1: Real Coverage in Agent Mode** | **Finished** | Union of pages actually returned by tools (`search_document`, `get_section`, `list_clauses`). Absence claims strictly prohibited on partial coverage. Exhaustive/absence queries automatically routed to map-reduce across all 150 pages. |
+| **Defect 2: Cross-Page Quotes & Running Headers/Footers** | **Finished** | Noise spans dynamically detected (frequency >= 30% or regex) and skipped during normalization without offset distortion. Verifies cross-page deliverable quote spanning pages 21–22. Automatic single-shot verbatim quote repair step. |
+| **Defect 3: Duplicate Quotes & Multi-Occurrences** | **Finished** | Verifier returns all occurrences across document (e.g., confidentiality on pp. 9 & 150). Merged into single card: `"Occurs 2× — pp. 9, 150"` with interactive Prev/Next occurrence navigation in viewer. |
+| **Defect 4: Evidence Support & Process Sanitization** | **Finished** | Absence answers display quotes as neutral `Related passage (does not answer question)` (no green badge). Irrelevant quotes flagged `Verified text, but may not support this claim`. Self-referential process statements stripped. |
+| **Defect 5: Section Delimitation & Agent Efficiency** | **Finished** | `get_section` delimits by next top-level Article/Section heading and extracts all segments (p. 112 liability cap surfaced under Article 55). Direct section shortcut bypasses agent loop. Research round notice moved to subtle footer note. |
+| **Defect 6: Real Agent Streaming & Delimiter Sanitization** | **Finished** | Token-by-token streaming via `aiClient.streamChatCompletion`. Machine delimiter `<<<QUOTES>>>` cleanly strips JSON and conversational preambles from visible prose. Interrupted streams persisted with `interrupted: true`. |
+| **Defect 7: Multi-Document Comparison & Document Scoping** | **Finished** | Comparative queries require both documents selected; refuses when only 1 is selected. Quotes require `documentId` and verify strictly against own document. Structured per-topic comparison with AED 100,000 (v1) and AED 1,000,000 (v2). |
+| **Frontend Polish & Citations** | **Finished** | Clickable `[1]` and `[[1]]` chips, markdown rendering, amber badge with "Search the whole document" map-reduce re-run button, zero-quote answers collapsed behind warning banner with "Show anyway". |
 | **OCR for Scanned PDFs** | **Not Finished** | Out of scope for this assignment. Scanned PDFs are accurately detected and rejected with a clear user-facing error message. |
 
 ---

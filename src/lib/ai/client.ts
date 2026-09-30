@@ -1,16 +1,10 @@
 export interface ChatMessageParam {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  content?: string | null;
   name?: string;
   tool_call_id?: string;
-  tool_calls?: Array<{
-    id: string;
-    type: 'function';
-    function: {
-      name: string;
-      arguments: string;
-    };
-  }>;
+  tool_calls?: any[];
+  extra_content?: any;
 }
 
 export interface ToolDefinition {
@@ -24,14 +18,8 @@ export interface ToolDefinition {
 
 export interface ChatCompletionResponse {
   content: string | null;
-  tool_calls?: Array<{
-    id: string;
-    type: 'function';
-    function: {
-      name: string;
-      arguments: string;
-    };
-  }>;
+  tool_calls?: any[];
+  extra_content?: any;
   providerUsed?: string;
 }
 
@@ -159,11 +147,17 @@ export class AIClient {
       .filter(Boolean);
 
     list.sort((a, b) => {
-      const idxA = cascadeEnv.indexOf(a.id);
-      const idxB = cascadeEnv.indexOf(b.id);
-      const posA = idxA === -1 ? 999 : idxA;
-      const posB = idxB === -1 ? 999 : idxB;
-      return posA - posB;
+      const getPos = (id: string) => {
+        let idx = cascadeEnv.indexOf(id);
+        if (idx === -1 && (id === 'primary' || id === 'gemini')) {
+          const geminiIdx = cascadeEnv.indexOf('gemini');
+          const primaryIdx = cascadeEnv.indexOf('primary');
+          const found = [geminiIdx, primaryIdx].filter((i) => i !== -1);
+          idx = found.length > 0 ? Math.min(...found) : -1;
+        }
+        return idx === -1 ? 999 : idx;
+      };
+      return getPos(a.id) - getPos(b.id);
     });
 
     this.providers.clear();
@@ -270,8 +264,17 @@ export class AIClient {
             signal?.removeEventListener('abort', onAbort);
           }
 
-          // If rate-limited (429), model not found (404), unsupported (400), or server error (5xx), try next model!
-          if (response.status === 429 || response.status === 404 || response.status === 400 || response.status === 402 || response.status >= 500) {
+          // If rate-limited (429) or quota exhausted (402), immediately switch to NEXT PROVIDER!
+          if (response.status === 429 || response.status === 402) {
+            const errBody = await response.text().catch(() => '');
+            console.warn(`[AI Cascade] Provider "${provider.name}" rate-limited (${response.status}). Immediately switching to next provider in cascade...`);
+            provider.rateLimitedUntil = Date.now() + 60_000;
+            errors.push({ provider: `${provider.name} [${model}]`, error: `HTTP ${response.status}: ${errBody.slice(0, 100)}` });
+            break; // Break model loop, jump to next provider immediately!
+          }
+
+          // If model not found (404), unsupported (400), or server error (5xx), try next model on this provider!
+          if (response.status === 404 || response.status === 400 || response.status >= 500) {
             const errBody = await response.text().catch(() => '');
             console.warn(`[AI Cascade] Provider "${provider.name}" (model: "${model}") returned status ${response.status}: ${errBody.slice(0, 100)}. Switching to next model...`);
             errors.push({ provider: `${provider.name} [${model}]`, error: `HTTP ${response.status}: ${errBody.slice(0, 100)}` });
@@ -291,6 +294,7 @@ export class AIClient {
           return {
             content: choice?.message?.content || null,
             tool_calls: choice?.message?.tool_calls,
+            extra_content: choice?.message?.extra_content,
             providerUsed: `${provider.name} (${model})`,
           };
         } catch (err: unknown) {
@@ -379,14 +383,25 @@ export class AIClient {
             signal: internalController.signal,
           });
 
-          // If rate-limited (429), model not found (404), unsupported (400), or server error (5xx), try next model!
-          if (response.status === 429 || response.status === 404 || response.status === 400 || response.status === 402 || response.status >= 500) {
+          // If rate-limited (429) or quota exhausted (402), immediately switch to NEXT PROVIDER!
+          if (response.status === 429 || response.status === 402) {
+            if (idleTimer) clearTimeout(idleTimer);
+            signal?.removeEventListener('abort', onAbort);
+            const errBody = await response.text().catch(() => '');
+            console.warn(`[AI Stream Cascade] Provider "${provider.name}" rate-limited (${response.status}). Immediately switching to next provider in cascade...`);
+            provider.rateLimitedUntil = Date.now() + 60_000;
+            errors.push(`${provider.name} [${model}] (Rate limited ${response.status})`);
+            break; // Break model loop, jump to next provider immediately!
+          }
+
+          // If model not found (404), unsupported (400), or server error (5xx), try next model!
+          if (response.status === 404 || response.status === 400 || response.status >= 500) {
             if (idleTimer) clearTimeout(idleTimer);
             signal?.removeEventListener('abort', onAbort);
             const errBody = await response.text().catch(() => '');
             console.warn(`[AI Stream Cascade] Provider "${provider.name}" (model: "${model}") status ${response.status}: ${errBody.slice(0, 100)}. Switching to next model...`);
             errors.push(`${provider.name} [${model}] (${response.status})`);
-            continue; // Try next model!
+            continue; // Try next model on this provider!
           }
 
           if (!response.ok || !response.body) {

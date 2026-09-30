@@ -89,7 +89,7 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
   };
 
   return (
-    <aside className="w-80 border-r border-slate-200 bg-white flex flex-col h-full shrink-0">
+    <aside className="w-full border-r border-slate-200 bg-white flex flex-col h-full shrink-0">
       {/* Sidebar Header */}
       <div className="p-4 border-b border-slate-100 flex flex-col gap-3">
         <div className="flex items-center justify-between">

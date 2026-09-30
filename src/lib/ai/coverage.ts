@@ -33,19 +33,37 @@ export interface RetrievalResult {
  */
 export function isExhaustiveQuestion(question: string): boolean {
   const q = question.toLowerCase();
+
+  // Questions seeking specific terms ("what is", "when", "what does article") are targeted, not exhaustive
+  if (/^(what\s+is|what\s+are|when\s+|how\s+|who\s+|whose\s+|what\s+does\s+(article|section|clause))\b/i.test(q)) {
+    if (!/\b(all\s+clauses|every\s+clause|list\s+all|what\s+are\s+all)\b/i.test(q)) {
+      return false;
+    }
+  }
+
   const patterns = [
-    /\b(does|is|are)\s+(the|this|any)\s+(contract|agreement|document)?\s*(contain|have|include|mention|state)\b/i,
-    /\bdoes\s+it\s+(contain|have|include|mention)\b/i,
-    /\b(is\s+there\s+any|are\s+there\s+any|is\s+there\s+a)\b/i,
+    /\b(does|is|are)\s+(the|this|any)\s+(contract|agreement|document)?\s*contain\s+(a|any)\b/i,
+    /\bdoes\s+it\s+contain\s+(a|any)\b/i,
+    /\b(is\s+there\s+any|are\s+there\s+any)\b/i,
     /\b(list\s+all|find\s+all|extract\s+all|what\s+are\s+all|show\s+all|list\s+every)\b/i,
     /\b(absence\s+of|is\s+absent|not\s+present|contain\s+any|prohibit\s+any)\b/i,
-    /\b(any\s+clause|every\s+clause|all\s+clauses\s+that|all\s+clauses)\b/i,
+    /\b(any\s+clause|every\s+clause|all\s+clauses\s+that)\b/i,
     /\bcontain\s+a\s+non-?compete\b/i,
     /\b(any\s+non-?compete)\b/i,
     /\b(any\s+penalty|any\s+restriction)\b/i,
   ];
 
   return patterns.some((p) => p.test(q));
+}
+
+/**
+ * Detects whether a question is asking to compare multiple contracts/documents.
+ * Matches: "two documents", "both documents", "both contracts", "compare", "differ", "differences"
+ */
+export function isComparativeQuestion(q: string): boolean {
+  return /\b(two\s+documents|both\s+documents|both\s+contracts|compare|differ|difference|differences|between\s+the\s+two|across\s+both|in\s+both)\b/i.test(
+    q
+  );
 }
 
 /**
@@ -290,6 +308,26 @@ export async function executeMapReduceRetrieval(
     }
 
     const batchText = batch.map((c) => `[Chunk ${c.id} - Page ${c.pageStart}]\n${c.text}`).join('\n\n');
+
+    // Fast pre-filter: extract substantive search keywords from question (excluding common stopwords)
+    const keywords = question
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, '')
+      .split(/\s+/)
+      .filter(
+        (w) =>
+          w.length > 2 &&
+          !['does', 'the', 'this', 'any', 'contract', 'agreement', 'contain', 'have', 'what', 'which', 'where', 'there', 'with', 'from', 'into', 'about', 'is', 'are', 'clause'].includes(w)
+      );
+
+    const lowerBatchText = batchText.toLowerCase();
+    const hasKeywordMatch = keywords.length === 0 || keywords.some((kw) => lowerBatchText.includes(kw));
+
+    if (!hasKeywordMatch) {
+      // Fast path: No query terms present in this batch.
+      // Pages are already recorded as examined in examinedPagesSet.
+      continue;
+    }
 
     // Prompt this batch to extract verbatim relevant passages or "NONE"
     try {
