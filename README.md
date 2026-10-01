@@ -116,6 +116,8 @@ Configure your environment variables in `.env`:
    ```bash
    cp .env.example .env
    ```
+   > **Note on PostgreSQL**: The project uses PostgreSQL exclusively (not SQLite) to support byte storage and cloud serverless deployments. For local development, you can use a free [Neon](https://neon.tech) or [Supabase](https://supabase.com) serverless PostgreSQL database URL (e.g. `postgresql://user:pass@ep-xyz.neon.tech/neondb?sslmode=require`) or a local PostgreSQL instance (`postgresql://postgres:password@localhost:5432/legal_contract_analyzer`).
+
 
 3. **Initialize Database Schema**:
    Push the Prisma schema to your PostgreSQL database:

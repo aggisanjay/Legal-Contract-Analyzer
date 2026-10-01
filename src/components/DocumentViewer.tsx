@@ -13,6 +13,7 @@ import {
   Download,
   AlertCircle,
   X,
+  RotateCcw,
 } from 'lucide-react';
 import { DocumentMetadata, VerifiedCitation } from '@/lib/types';
 
@@ -598,8 +599,20 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
           {document.statusMessage || 'Extracting canonical text, chunking legal clauses, and indexing...'}
         </p>
         <span className="text-[11px] font-mono text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full border border-blue-200">
-          Stage: {document.processingStage || 'Indexing'}
+          Stage: {document.processingStage || 'Uploading'}
         </span>
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => {
+              fetch(`/api/documents/${document.id}/process`, { method: 'POST', keepalive: true }).catch(() => {});
+            }}
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 shadow-2xs transition-colors flex items-center gap-1.5"
+          >
+            <RotateCcw className="w-3 h-3" />
+            <span>Resume Processing</span>
+          </button>
+        </div>
       </div>
     );
   }

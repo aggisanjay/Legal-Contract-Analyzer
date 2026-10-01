@@ -58,6 +58,53 @@ export default function Home() {
     fetchDocuments();
   }, []);
 
+  // Auto-poll and resume processing for any documents in PROCESSING or UPLOADING state
+  useEffect(() => {
+    const processingDocs = documents.filter(
+      (d) => d.status === 'PROCESSING' || d.status === 'UPLOADING'
+    );
+    if (processingDocs.length === 0) return;
+
+    // Trigger /process for each processing doc in case background serverless execution was interrupted
+    processingDocs.forEach((d) => {
+      fetch(`/api/documents/${d.id}/process`, { method: 'POST', keepalive: true }).catch(() => {});
+    });
+
+    const pollTimer = setInterval(async () => {
+      let anyChanged = false;
+      const updatedDocs = await Promise.all(
+        documents.map(async (doc) => {
+          if (doc.status !== 'PROCESSING' && doc.status !== 'UPLOADING') return doc;
+          try {
+            const res = await fetch(`/api/documents/${doc.id}/status`);
+            if (!res.ok) return doc;
+            const data = await res.json();
+            if (data.status !== doc.status || data.stage !== doc.processingStage) {
+              anyChanged = true;
+              return {
+                ...doc,
+                status: data.status,
+                processingStage: data.stage,
+                statusMessage: data.message,
+                pageCount: data.pageCount ?? doc.pageCount,
+              };
+            }
+          } catch {}
+          return doc;
+        })
+      );
+
+      if (anyChanged) {
+        setDocuments(updatedDocs);
+        if (!updatedDocs.some((d) => d.status === 'PROCESSING' || d.status === 'UPLOADING')) {
+          fetchDocuments();
+        }
+      }
+    }, 1500);
+
+    return () => clearInterval(pollTimer);
+  }, [documents]);
+
   const activeDocument = documents.find((d) => d.id === activeDocumentId) || null;
   const selectedDocuments = documents.filter((d) => selectedDocumentIds.includes(d.id));
 
