@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { normalizeCitationMarkers } from '@/lib/ai/stream-cleaner';
 
 export const dynamic = 'force-dynamic';
 
@@ -37,7 +38,7 @@ export async function GET(req: NextRequest) {
           id: m.id,
           conversationId: m.conversationId,
           role: m.role,
-          content: m.content,
+          content: normalizeCitationMarkers(m.content),
           citations: m.citations,
           interrupted: m.interrupted,
           verifiedCount: m.verifiedCount,

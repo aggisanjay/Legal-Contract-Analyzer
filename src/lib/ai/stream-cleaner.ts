@@ -2,8 +2,44 @@ export const MACHINE_DELIMITER = '<<<QUOTES>>>';
 export const LEGACY_DELIMITER = '---QUOTES---';
 
 /**
+ * Normalizes complex or nested citation markers emitted by LLMs into clean, uniform individual markers:
+ * - [[1], [2]] -> [1] [2]
+ * - [[1]] -> [1]
+ * - [1, 2] or [1,2] or [1, 2, 3] -> [1] [2] or [1] [2] [3]
+ * - [1][2] -> [1] [2]
+ * - [1], [2] -> [1] [2]
+ */
+export function normalizeCitationMarkers(text: string): string {
+  if (!text) return text;
+  let result = text;
+
+  // 1. [[1], [2]] or [[1], [2], [3]] -> [1] [2]
+  result = result.replace(/\[\[\s*(\d+)\s*\](?:\s*,\s*\[\s*(\d+)\s*\])+\]/g, (match) => {
+    const numbers = match.match(/\d+/g) || [];
+    return numbers.map((n) => `[${n}]`).join(' ');
+  });
+
+  // 2. [[1]] -> [1]
+  result = result.replace(/\[\[\s*(\d+)\s*\]\]/g, '[$1]');
+
+  // 3. [1, 2] or [1,2] or [1, 2, 3] -> [1] [2] or [1] [2] [3]
+  result = result.replace(/\[\s*(\d+)(?:\s*,\s*(\d+))+\s*\]/g, (match) => {
+    const numbers = match.match(/\d+/g) || [];
+    return numbers.map((n) => `[${n}]`).join(' ');
+  });
+
+  // 4. [1][2] -> [1] [2] (adjacent brackets with no delimiter)
+  result = result.replace(/(\[\d+\])(?=\[\d+\])/g, '$1 ');
+
+  // 5. [1], [2] -> [1] [2]
+  result = result.replace(/(\[\d+\])\s*,\s*(?=\[\d+\])/g, '$1 ');
+
+  return result;
+}
+
+/**
  * Strips preamble boilerplate like "The governing law is clearly stated in the contract.\n\n---\n\n"
- * or lone "---" lines from the visible answer prose.
+ * or lone "---" lines from the visible answer prose, and normalizes citation markers.
  */
 export function cleanAnswerPreambleAndSeparators(text: string): string {
   let cleaned = text;
@@ -28,7 +64,7 @@ export function cleanAnswerPreambleAndSeparators(text: string): string {
     })
     .join('\n');
 
-  return cleaned.trim();
+  return normalizeCitationMarkers(cleaned.trim());
 }
 
 /**

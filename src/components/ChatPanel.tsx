@@ -34,6 +34,7 @@ import {
   AgentTimelineStep,
 } from '@/lib/types';
 import { formatPageRanges, deduplicateVerifiedCitations } from '@/lib/utils/format';
+import { normalizeCitationMarkers } from '@/lib/ai/stream-cleaner';
 
 interface ChatPanelProps {
   activeDocument: DocumentMetadata | null;
@@ -486,25 +487,27 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     setExpandedTimelines((prev) => ({ ...prev, [msgId]: !prev[msgId] }));
   };
 
-  // Render prose with inline clickable [n] and [[n]] chips and basic markdown
+  // Render prose with inline clickable [n] chips and basic markdown
   const renderMessageContent = (content: string, citations: VerifiedCitation[] = []) => {
     if (!content) return null;
 
-    // Check if there is a research cap footnote
-    let mainText = content;
+    // Normalize any complex or nested citation markers
+    let mainText = normalizeCitationMarkers(content);
     let capFootnote: string | null = null;
-    const capMatch = content.match(/\*\((Research stopped at \d+ rounds)\)\*/i);
+    const capMatch = mainText.match(/\*\((Research stopped at \d+ rounds)\)\*/i);
     if (capMatch) {
       capFootnote = capMatch[1];
-      mainText = content.replace(/\*\((Research stopped at \d+ rounds)\)\*/i, '').trim();
+      mainText = mainText.replace(/\*\((Research stopped at \d+ rounds)\)\*/i, '').trim();
     }
 
     // Split text by lines to handle headers and bullet points
     const lines = mainText.split('\n');
 
     const renderInlineFormatting = (line: string, lineKey: string) => {
-      // Tokenize by citation markers [1], [[1]], and bold **text**
-      const tokens = line.split(/(\[\[\d+\]\]|\[\d+\]|\*\*[^*]+\*\*)/g);
+      // Normalize line first to handle any unnormalized inline sequences
+      const normalizedLine = normalizeCitationMarkers(line);
+      // Tokenize by citation markers [n] or [[n]], and bold **text**
+      const tokens = normalizedLine.split(/(\[\[\d+\]\]|\[\d+\]|\*\*[^*]+\*\*)/g);
 
       return tokens.map((token, tIdx) => {
         const key = `${lineKey}_t_${tIdx}`;
@@ -514,17 +517,36 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
         if (citMatch) {
           const citNum = parseInt(citMatch[1] || citMatch[2], 10);
           const citation =
-            citations.find((c) => c.id === String(citNum)) ||
+            citations.find((c) => (c as any).citationNumber === citNum || c.id === String(citNum) || c.id === `cit_${citNum}`) ||
             citations[citNum - 1] ||
             citations[0];
+
+          let tooltip = `Citation [${citNum}]`;
+          if (citation) {
+            const docLabel = isMultiDoc && citation.documentName ? `${citation.documentName}: ` : '';
+            const preview = citation.quote.length > 80 ? `${citation.quote.slice(0, 80)}…` : citation.quote;
+            tooltip = `${docLabel}"${preview}"`;
+          }
 
           return (
             <button
               key={key}
               type="button"
-              onClick={() => citation && onSelectCitation(citation)}
+              onClick={() => {
+                if (citation) {
+                  onSelectCitation(citation);
+                  const cardEl = document.getElementById(`quote-card-${citation.id}`);
+                  if (cardEl) {
+                    cardEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    cardEl.classList.add('ring-2', 'ring-emerald-500');
+                    setTimeout(() => {
+                      cardEl.classList.remove('ring-2', 'ring-emerald-500');
+                    }, 2000);
+                  }
+                }
+              }}
               className="inline-flex items-center justify-center px-1.5 py-0.2 mx-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border border-emerald-300 transition-all cursor-pointer align-baseline shadow-2xs"
-              title={citation ? `View verified quote from ${citation.documentName || 'contract'}` : `Citation [${citNum}]`}
+              title={tooltip}
             >
               [{citNum}]
             </button>
@@ -926,6 +948,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                       return (
                         <div
                           key={`cit_${cit.id || cIdx}`}
+                          id={`quote-card-${cit.id || cIdx}`}
                           className={`p-3 rounded-xl transition-all shadow-2xs border ${
                             cit.supportStatus === 'related'
                               ? 'bg-slate-50/80 hover:bg-slate-100/60 border-slate-300'
@@ -934,8 +957,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                               : 'bg-emerald-50/60 hover:bg-emerald-50 border-emerald-200'
                           }`}
                         >
-                          <div className="flex items-center justify-between text-[11px] mb-1.5">
-                            <div className="flex items-center gap-1.5">
+                          <div className="flex items-center justify-between text-[11px] mb-1.5 gap-2">
+                            <div className="flex items-center gap-1.5 flex-wrap">
                               <span
                                 className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold border ${
                                   cit.supportStatus === 'related'
@@ -970,9 +993,21 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                             </div>
 
                             {cit.documentName && (
-                              <span className="text-[10px] text-slate-500 font-medium truncate max-w-[140px]">
-                                {cit.documentName}
-                              </span>
+                              <button
+                                type="button"
+                                onClick={() => onSelectCitation(cit)}
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border transition-colors cursor-pointer shrink-0 ${
+                                  cit.documentName.toLowerCase().includes('v1') || cit.documentName.toLowerCase().includes('doc_1')
+                                    ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100'
+                                    : cit.documentName.toLowerCase().includes('v2') || cit.documentName.toLowerCase().includes('doc_2')
+                                    ? 'bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100'
+                                    : 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
+                                }`}
+                                title={`Switch viewer to ${cit.documentName} and jump to quote`}
+                              >
+                                <FileText className="w-2.5 h-2.5" />
+                                <span className="truncate max-w-[140px]">{cit.documentName}</span>
+                              </button>
                             )}
                           </div>
 
@@ -1032,16 +1067,16 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                 );
               })()}
 
-                {/* Unverified Group (Collapsed by default, amber styling, not clickable) */}
+                {/* Unverified Group (Collapsed by default, distinct failure reasons) */}
                 {!isUser && unverified.length > 0 && (
                   <div className="w-full mt-2 rounded-xl border border-amber-200 bg-amber-50/50 p-2 text-xs">
                     <details className="group">
                       <summary className="cursor-pointer text-[10px] font-semibold text-amber-900 flex items-center justify-between select-none">
                         <span className="flex items-center gap-1.5">
                           <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-                          <span>Unverified Quotes ({unverified.length})</span>
+                          <span>Failed to Verify ({unverified.length})</span>
                           <span className="text-[9px] font-normal text-amber-700 italic">
-                            — removed from evidence
+                            — candidate quotes excluded from proof
                           </span>
                         </span>
                         <ChevronDown className="w-3 h-3 text-amber-600 group-open:rotate-180 transition-transform" />
@@ -1049,20 +1084,41 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
                       <div className="mt-2 space-y-2 border-t border-amber-200/60 pt-2">
                         <p className="text-[10px] text-amber-800 italic">
-                          These candidate quotes could not be verified against the canonical contract text and have been excluded from proof.
+                          These candidate quotes could not be verified against the canonical contract text:
                         </p>
                         {unverified.map((uCit, uIdx) => (
                           <div
                             key={`ucit_${uIdx}`}
-                            className="p-2 rounded-lg bg-white/80 border border-amber-200 text-[10px] text-slate-700"
+                            className="p-2.5 rounded-lg bg-white/80 border border-amber-200 text-[10px] text-slate-700 space-y-1.5"
                           >
-                            <p className="font-serif italic text-slate-600 line-clamp-2 mb-1">
+                            <div className="flex items-center justify-between text-[9px] gap-2">
+                              {uCit.documentName && uCit.documentName !== 'Unknown Document' ? (
+                                <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-medium border shrink-0 ${
+                                  uCit.documentName.toLowerCase().includes('v1') || uCit.documentName.toLowerCase().includes('doc_1')
+                                    ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                    : uCit.documentName.toLowerCase().includes('v2') || uCit.documentName.toLowerCase().includes('doc_2')
+                                    ? 'bg-purple-50 text-purple-700 border-purple-200'
+                                    : 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                                }`}>
+                                  <FileText className="w-2.5 h-2.5" />
+                                  <span className="truncate max-w-[130px]">{uCit.documentName}</span>
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-medium bg-rose-50 text-rose-700 border border-rose-200 shrink-0">
+                                  Unknown Document
+                                </span>
+                              )}
+                              <span className="text-amber-900 font-semibold truncate text-right">
+                                {uCit.reason === 'unknown document'
+                                  ? 'Unknown document'
+                                  : uCit.reason
+                                  ? uCit.reason
+                                  : `Quote not found in ${uCit.documentName || 'contract'} verbatim`}
+                              </span>
+                            </div>
+                            <p className="font-serif italic text-slate-600 line-clamp-2">
                               "{uCit.quote}"
                             </p>
-                            <div className="flex items-center justify-between text-[9px] text-amber-800 font-medium">
-                              <span>Reason: {uCit.reason || 'Verification match failed'}</span>
-                              <span className="text-slate-400">Not clickable</span>
-                            </div>
                           </div>
                         ))}
                       </div>
