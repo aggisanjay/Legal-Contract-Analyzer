@@ -7,6 +7,9 @@ const nextConfig = {
   },
   experimental: {
     serverComponentsExternalPackages: ['pdfjs-dist', '@prisma/client', 'prisma', 'pdf-lib', 'mammoth'],
+    outputFileTracingIncludes: {
+      '/api/**/*': ['./node_modules/pdfjs-dist/legacy/build/pdf.worker.js'],
+    },
   },
 };
 

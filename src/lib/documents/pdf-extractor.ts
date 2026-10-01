@@ -5,8 +5,11 @@ import { ExtractedDocument, ExtractedPage } from '../types';
  * Preserves page offsets, section markers, and detects empty/scanned PDFs.
  */
 export async function extractPdfText(pdfBuffer: Buffer): Promise<ExtractedDocument & { isScannedOrEmpty: boolean }> {
-  // Dynamically import pdfjs-dist legacy build for reliable Node.js execution
-  const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.js');
+  // Dynamically import pdfjs worker and library for reliable serverless Node.js execution
+  // @ts-ignore - worker module lacks ambient types in legacy build
+  const pdfjsWorker: any = await import('pdfjs-dist/legacy/build/pdf.worker.js');
+  (globalThis as any).pdfjsWorker = pdfjsWorker;
+  const pdfjsLib: any = await import('pdfjs-dist/legacy/build/pdf.js');
 
   const uint8Array = new Uint8Array(pdfBuffer);
   const loadingTask = pdfjsLib.getDocument({
