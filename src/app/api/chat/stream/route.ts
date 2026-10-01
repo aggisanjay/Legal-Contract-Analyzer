@@ -258,14 +258,7 @@ export async function POST(req: NextRequest) {
             }
 
             const topicTerms = Array.from(
-              new Set(
-                `${topicQuery} ${question}`
-                  .toLowerCase()
-                  .replace(/[^\w\s]/g, ' ')
-                  .split(/\s+/)
-                  .filter((w) => w.length > 1 && !STOPWORDS.has(w))
-                  .map((w) => lightStem(w))
-              )
+              new Set(tokenizeAndStem(`${topicQuery} ${question}`))
             );
 
             const docEvidenceList: Array<{

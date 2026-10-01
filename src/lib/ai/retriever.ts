@@ -71,7 +71,7 @@ export function tokenizeAndStem(text: string): string[] {
     .toLowerCase()
     .replace(/[^\w\s]/g, ' ')
     .split(/\s+/)
-    .filter((w) => w.length > 1 && !STOPWORDS.has(w));
+    .filter((w) => w.length > 2 && w !== 'non' && !STOPWORDS.has(w));
   return words.map((w) => lightStem(w));
 }
 

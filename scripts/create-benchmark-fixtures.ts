@@ -184,7 +184,7 @@ export async function generateBenchmark150PageContract(
         font: boldFont,
       });
       y -= 25;
-      page.drawText('This Agreement shall be governed by and construed in accordance with the laws of the Emirate of Dubai and the federal laws of the United Arab Emirates.', {
+      page.drawText('This Agreement shall be governed by the laws of the Emirate of Dubai.', {
         x: 50,
         y,
         size: 10,
