@@ -66,40 +66,67 @@ export function isComparativeQuestion(q: string): boolean {
   );
 }
 
+export type AnswerType = 'found' | 'not_found' | 'comparison';
+
 /**
- * Detects whether an answer claims that a clause or term is absent or not found.
+ * Determines whether an answer represents an absence claim.
+ * Decided primarily by answerType ('not_found').
+ * If answerType is 'found' or 'comparison', it is NEVER an absence claim.
+ * As a safety net when answerType is unspecified or ambiguous, checks only the first sentence
+ * for explicit absence declarations, strictly excluding comparison phrases like "no difference(s)".
  */
-export function isAbsenceClaim(text: string): boolean {
-  const t = text.toLowerCase();
-  const patterns = [
-    /\bno\s+non-?compete\b/i,
-    /\bnot\s+found\b/i,
-    /\b(?:the\s+)?(?:contract|agreement|document)\s+does\s+not\s+contain\b/i,
-    /\bdoes\s+not\s+(?:contain|have|include|mention)\b/i,
-    /\bis\s+not\s+present\b/i,
-    /\bthere\s+is\s+no\b/i,
-    /\bthere\s+are\s+no\b/i,
-    /\bno\s+mention\s+of\b/i,
-    /\bcontains\s+no\b/i,
-    /\b(?:could\s+not|cannot|can\s+not)\s+find\s+any\b/i,
-    /\bnot\s+contained\s+in\s+the\s+contract\b/i,
+export function isAbsenceClaim(text: string, answerType?: string): boolean {
+  if (answerType === 'found' || answerType === 'comparison') {
+    return false;
+  }
+  if (answerType === 'not_found') {
+    return true;
+  }
+
+  // Never match comparison answers or statements discussing differences between contracts
+  if (/\bno\s+differences?\b/i.test(text) || (/\bneither\s+contract\b/i.test(text) && /\bdiffers?\b/i.test(text))) {
+    return false;
+  }
+
+  // Safety net: check only the first sentence of the answer
+  const firstSentence = text.trim().split(/(?<=[.?!])\s+/)[0] || '';
+  const firstLower = firstSentence.toLowerCase();
+
+  const narrowedPatterns = [
+    /(?:contract|agreement|document)\s+(?:does\s+not\s+contain|has\s+no|contains\s+no)\b/i,
+    /\b(?:is|are)\s+not\s+present\b/i,
+    /\bnot\s+found\s+in\s+(?:the|either|any)\s+(?:contract|document|agreement)\b/i,
+    /\bno\s+non-?compete\s+(?:clause|provision|restriction)\b/i,
     /\bno\s+such\s+clause\b/i,
+    /\b(?:could\s+not|cannot|can\s+not)\s+find\s+any\s+(?:such\s+)?clause\b/i,
   ];
-  return patterns.some((p) => p.test(t));
+
+  return narrowedPatterns.some((p) => p.test(firstLower));
 }
 
 /**
  * Enforces in code: Absence claims are allowed only when pagesExamined == pagesTotal.
- * Otherwise the server must replace:
- * "I looked at pages X, Y but did not read the whole document, so I can't confirm this clause is absent."
+ * Must only rewrite an answer when answerType === "not_found" AND coverage is partial.
+ * It must never touch comparison answers or phrases like "no differences".
  */
 export function enforceAbsenceCoverage(
   answer: string,
   pagesExaminedList: number[],
   pagesExamined: number,
-  pagesTotal: number
+  pagesTotal: number,
+  answerType?: string
 ): { modifiedText: string; isAbsence: boolean } {
-  const isAbsence = isAbsenceClaim(answer);
+  // If explicitly comparison or found, never touch
+  if (answerType === 'comparison' || answerType === 'found') {
+    return { modifiedText: answer, isAbsence: false };
+  }
+
+  // Comparison phrases like "no differences" must never be rewritten as absence
+  if (/\bno\s+differences?\b/i.test(answer)) {
+    return { modifiedText: answer, isAbsence: false };
+  }
+
+  const isAbsence = isAbsenceClaim(answer, answerType);
   if (isAbsence && pagesExamined < pagesTotal) {
     let pagesStr = 'reviewed pages';
     if (pagesExaminedList && pagesExaminedList.length > 0) {
@@ -113,6 +140,70 @@ export function enforceAbsenceCoverage(
     };
   }
   return { modifiedText: answer, isAbsence };
+}
+
+export interface CandidateQuote {
+  id?: number;
+  doc?: string;
+  documentId?: string;
+  quote: string;
+  chunkId?: string;
+}
+
+export interface ParsedQuotesPayload {
+  answerType: AnswerType;
+  citations: CandidateQuote[];
+}
+
+/**
+ * Parses machine payload output from model following the <<<QUOTES>>> delimiter.
+ * Supports both JSON object { "answerType": "...", "citations": [...] } and JSON array [ ... ].
+ */
+export function parseQuotesPayload(
+  rawJson: string,
+  defaultAnswerType: AnswerType = 'found'
+): ParsedQuotesPayload {
+  let answerType: AnswerType = defaultAnswerType;
+  let citations: CandidateQuote[] = [];
+
+  const trimmed = rawJson.trim();
+  if (!trimmed) {
+    return { answerType, citations };
+  }
+
+  try {
+    // 1. Check for JSON object { "answerType": "...", "citations": [...] }
+    const objMatch = trimmed.match(/\{[\s\S]*\}/);
+    if (objMatch) {
+      try {
+        const parsed = JSON.parse(objMatch[0]);
+        if (parsed.answerType) {
+          answerType = parsed.answerType;
+        } else if (parsed.found === false) {
+          answerType = 'not_found';
+        } else if (parsed.found === true) {
+          answerType = 'found';
+        }
+
+        const rawList = parsed.citations || parsed.quotes || [];
+        if (Array.isArray(rawList)) {
+          citations = rawList;
+        }
+      } catch {}
+    }
+
+    // 2. Fallback to matching JSON array directly [ ... ]
+    if (citations.length === 0) {
+      const arrMatch = trimmed.match(/\[[\s\S]*\]/);
+      if (arrMatch) {
+        citations = JSON.parse(arrMatch[0]);
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to parse quotes payload JSON:', err);
+  }
+
+  return { answerType, citations };
 }
 
 /**
