@@ -63,6 +63,7 @@ export default function Home() {
 
   // Handlers
   const handleSelectActiveDocument = (doc: DocumentMetadata) => {
+    if (doc.status === 'FAILED') return; // A failed document must never be openable for chat or analysis
     setActiveDocumentId(doc.id);
     setActiveCitation(null);
     if (!selectedDocumentIds.includes(doc.id)) {
@@ -89,8 +90,62 @@ export default function Home() {
     setSelectedDocumentIds((prev) => prev.filter((id) => id !== docId));
 
     if (activeDocumentId === docId) {
-      const remaining = documents.filter((d) => d.id !== docId);
+      const remaining = documents.filter((d) => d.id !== docId && d.status === 'READY');
       setActiveDocumentId(remaining[0]?.id || null);
+    }
+  };
+
+  const handleRetryDocument = async (docId: string) => {
+    try {
+      setDocuments((prev) =>
+        prev.map((d) =>
+          d.id === docId
+            ? {
+                ...d,
+                status: 'PROCESSING',
+                processingStage: 'Extracting text',
+                statusMessage: 'Retrying document processing...',
+              }
+            : d
+        )
+      );
+
+      // Trigger dedicated 60-second processing route
+      fetch(`/api/documents/${docId}/process`, { method: 'POST' }).catch((err) => {
+        console.warn('Retry trigger error:', err);
+      });
+
+      // Poll status every second until completion
+      const pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/documents/${docId}/status`);
+          if (res.ok) {
+            const data = await res.json();
+            setDocuments((prev) =>
+              prev.map((d) =>
+                d.id === docId
+                  ? {
+                      ...d,
+                      status: data.status,
+                      processingStage: data.stage,
+                      statusMessage: data.message,
+                      pageCount: data.pageCount ?? d.pageCount,
+                    }
+                  : d
+              )
+            );
+
+            if (data.status === 'READY' || data.status === 'FAILED') {
+              clearInterval(pollTimer);
+              fetchDocuments();
+            }
+          }
+        } catch {
+          // Keep polling
+        }
+      }, 1000);
+    } catch (err) {
+      console.error('Failed to retry document:', err);
     }
   };
 
@@ -182,6 +237,7 @@ export default function Home() {
             onSelectActiveDocument={handleSelectActiveDocument}
             onToggleDocumentSelection={handleToggleDocumentSelection}
             onDeleteDocument={handleDeleteDocument}
+            onRetryDocument={handleRetryDocument}
             onOpenUpload={() => setIsUploadModalOpen(true)}
             isLoading={isLoadingDocs}
           />

@@ -3,6 +3,8 @@ import { prisma } from '@/lib/prisma';
 import { documentStorage } from '@/lib/documents/storage';
 
 export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+export const maxDuration = 60;
 
 export async function GET(
   _req: NextRequest,

@@ -13,6 +13,7 @@ import {
   Calendar,
   Layers,
   Search,
+  RotateCcw,
 } from 'lucide-react';
 import { DocumentMetadata } from '@/lib/types';
 
@@ -23,6 +24,7 @@ interface DocumentLibraryProps {
   onSelectActiveDocument: (doc: DocumentMetadata) => void;
   onToggleDocumentSelection: (docId: string) => void;
   onDeleteDocument: (docId: string) => Promise<void>;
+  onRetryDocument?: (docId: string) => Promise<void>;
   onOpenUpload: () => void;
   isLoading: boolean;
 }
@@ -34,6 +36,7 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
   onSelectActiveDocument,
   onToggleDocumentSelection,
   onDeleteDocument,
+  onRetryDocument,
   onOpenUpload,
   isLoading,
 }) => {
@@ -248,7 +251,21 @@ export const DocumentLibrary: React.FC<DocumentLibraryProps> = ({
                 {isFailed && (
                   <div className="mt-2 text-[11px] text-rose-700 bg-rose-50/80 p-2 rounded-lg border border-rose-200">
                     <p className="line-clamp-2 leading-snug">{doc.statusMessage || 'Processing failed'}</p>
-                    <div className="mt-1 flex justify-end">
+                    <div className="mt-1.5 flex items-center justify-end gap-3">
+                      {onRetryDocument && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRetryDocument(doc.id);
+                          }}
+                          className="text-[10px] font-semibold text-blue-600 hover:text-blue-800 hover:underline flex items-center gap-1"
+                          title="Re-run document processing"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          Retry
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={(e) => {

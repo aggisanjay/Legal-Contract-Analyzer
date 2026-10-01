@@ -7,6 +7,7 @@ import { chunkDocument } from './chunker';
 import { getEmbeddingProvider } from '../ai/embeddings';
 import { documentStorage } from './storage';
 import { DocumentMetadata, ExtractedDocument } from '../types';
+import { mapDocumentError } from './error-mapper';
 
 const MAX_FILE_SIZE_DEFAULT = 50 * 1024 * 1024; // 50 MB
 
@@ -75,17 +76,38 @@ export function validateDocumentUpload(
  */
 export async function processDocumentInBackground(
   documentId: string,
-  buffer: Buffer,
-  originalFilename: string,
-  mimeType: string
+  buffer?: Buffer,
+  originalFilename?: string,
+  mimeType?: string
 ): Promise<void> {
-  const ext = path.extname(originalFilename).toLowerCase();
   const storageBase = process.env.STORAGE_DIR || path.join(process.cwd(), 'storage');
   const renderedDir = path.join(storageBase, 'rendered');
 
   try {
+    // If buffer is missing (e.g. retry request), load from storage
+    if (!buffer || buffer.length === 0) {
+      const stored = await documentStorage.getOriginalFile(documentId);
+      if (!stored || stored.length === 0) {
+        throw new Error('Original file bytes not found in storage.');
+      }
+      buffer = stored;
+    }
+
+    if (!originalFilename || !mimeType) {
+      const docRecord = await prisma.document.findUnique({
+        where: { id: documentId },
+        select: { originalFilename: true, mimeType: true },
+      });
+      if (docRecord) {
+        originalFilename = originalFilename || docRecord.originalFilename;
+        mimeType = mimeType || docRecord.mimeType;
+      }
+    }
+
+    const ext = path.extname(originalFilename || '').toLowerCase();
+
     // Stage 1: Persist file bytes in database and disk cache
-    await documentStorage.saveOriginalFile(documentId, originalFilename, buffer);
+    await documentStorage.saveOriginalFile(documentId, originalFilename || `${documentId}.bin`, buffer);
 
     // Stage 2: Extracting text
     await prisma.document.update({
@@ -117,19 +139,17 @@ export async function processDocumentInBackground(
       throw new Error('Unsupported file type. Please upload a PDF or DOCX.');
     }
 
-    // Check for empty or scanned documents with specific messages per type
+    // Check for empty or scanned documents
     if (isScannedOrEmpty || !extracted.text || extracted.text.trim().length === 0) {
-      const failMessage =
-        ext === '.pdf'
-          ? 'This PDF appears to be scanned or contains no readable text. Please upload a text-based PDF or DOCX.'
-          : 'This DOCX document contains no readable text. Please upload a document with readable text.';
-
+      const mapped = mapDocumentError(new Error('Scanned or empty document'), true, mimeType || 'application/pdf');
+      console.warn(`[Doc ${documentId}] Scanned/empty file detected: ${mapped.userMessage}`);
       await prisma.document.update({
         where: { id: documentId },
         data: {
           status: 'FAILED',
           processingStage: 'Ready',
-          statusMessage: failMessage,
+          statusMessage: mapped.userMessage,
+          errorDetail: mapped.errorDetail,
           pageCount: extracted?.pageCount || 0,
         },
       });
@@ -166,6 +186,11 @@ export async function processDocumentInBackground(
       await documentStorage.saveRenderedPdf(documentId, renderedPdfBuffer);
     }
 
+    // Clear any previous chunks if retrying
+    await prisma.documentChunk.deleteMany({
+      where: { documentId },
+    });
+
     // Save chunks to database
     await prisma.documentChunk.createMany({
       data: chunkResults.map((chunk, idx) => ({
@@ -189,6 +214,7 @@ export async function processDocumentInBackground(
         status: 'READY',
         processingStage: 'Ready',
         statusMessage: 'Ready',
+        errorDetail: null,
         extractedText: extracted.text,
         pageCount: extracted.pageCount,
         pagesJson: extracted.pages.map((p) => ({
@@ -200,14 +226,15 @@ export async function processDocumentInBackground(
       },
     });
   } catch (err: unknown) {
-    const errorMsg = err instanceof Error ? err.message : 'Unable to process this document.';
-    console.error(`Document processing failed for ID ${documentId}:`, err);
+    const mapped = mapDocumentError(err, false, mimeType || 'application/pdf');
+    console.error(`[Doc ${documentId}] Processing failed:`, err);
     await prisma.document
       .update({
         where: { id: documentId },
         data: {
           status: 'FAILED',
-          statusMessage: errorMsg,
+          statusMessage: mapped.userMessage,
+          errorDetail: mapped.errorDetail,
           processingStage: 'Ready',
         },
       })

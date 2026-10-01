@@ -4,6 +4,7 @@ import { documentStorage } from '@/lib/documents/storage';
 import { renderDocxToHtml } from '@/lib/documents/docx-extractor';
 
 export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
 
 export async function GET(
   _req: NextRequest,

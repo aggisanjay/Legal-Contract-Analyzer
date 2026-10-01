@@ -164,6 +164,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
       setCurrentStage('Extracting text');
       setProgressPercent(30);
 
+      // Trigger dedicated 60-second processing route
+      fetch(`/api/documents/${docId}/process`, { method: 'POST' }).catch((err) => {
+        console.warn('Dedicated process route trigger error:', err);
+      });
+
       // Start polling status
       startPollingStatus(docId);
     } catch (err: unknown) {
@@ -384,21 +389,37 @@ export const UploadModal: React.FC<UploadModalProps> = ({ onClose, onSuccess }) 
                 <p className="text-[11px] text-rose-700">{failureReason}</p>
               </div>
 
-              <div className="flex justify-center gap-2 pt-2">
+              <div className="flex flex-wrap justify-center gap-2 pt-2">
+                {uploadedDocId && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsFailed(false);
+                      setIsProcessing(true);
+                      setCurrentStage('Extracting text');
+                      setProgressPercent(30);
+                      fetch(`/api/documents/${uploadedDocId}/process`, { method: 'POST' }).catch(() => {});
+                      startPollingStatus(uploadedDocId);
+                    }}
+                    className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Retry Processing</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={handleDeleteFailed}
                   className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-xl"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  <span>Delete & Reset</span>
+                  <span>Delete</span>
                 </button>
                 <button
                   type="button"
                   onClick={handleReset}
-                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl"
+                  className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 border border-slate-200 rounded-xl"
                 >
-                  <RotateCcw className="w-3.5 h-3.5" />
                   <span>Upload Another</span>
                 </button>
               </div>

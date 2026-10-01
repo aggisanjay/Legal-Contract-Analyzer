@@ -28,6 +28,7 @@ model Document {
   processingStage  String?        // 'Uploading' | 'Extracting text' | 'Splitting into sections' | 'Indexing' | 'Ready'
   fileData         Bytes?         // Stored original file bytes for serverless persistence
   renderedPdfData  Bytes?         // Stored rendered PDF bytes for viewer persistence
+  errorDetail      String?        @db.Text // Technical detail logged on server, not shown in UI
   originalFilePath String
   renderedPdfPath  String?
   createdAt        DateTime       @default(now())

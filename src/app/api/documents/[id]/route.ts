@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs/promises';
 import { prisma } from '@/lib/prisma';
+import { documentStorage } from '@/lib/documents/storage';
 
 export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
 
 export async function GET(
   _req: NextRequest,
@@ -53,13 +54,8 @@ export async function DELETE(
       return NextResponse.json({ error: 'Document not found' }, { status: 404 });
     }
 
-    // 1. Delete physical files from disk
-    if (doc.originalFilePath) {
-      await fs.unlink(doc.originalFilePath).catch(() => {});
-    }
-    if (doc.renderedPdfPath && doc.renderedPdfPath !== doc.originalFilePath) {
-      await fs.unlink(doc.renderedPdfPath).catch(() => {});
-    }
+    // 1. Delete stored bytes and cached files via storage interface
+    await documentStorage.delete(params.id);
 
     // 2. Cascade delete database records
     await prisma.document.delete({

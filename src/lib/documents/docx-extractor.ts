@@ -220,6 +220,10 @@ async function renderTextToPdf(pages: ExtractedPage[], outputPath: string): Prom
   }
 
   const pdfBytes = await pdfDoc.save();
-  await fs.writeFile(outputPath, pdfBytes);
+  try {
+    await fs.writeFile(outputPath, pdfBytes);
+  } catch {
+    // Ephemeral or read-only disk in serverless environment
+  }
   return Buffer.from(pdfBytes);
 }

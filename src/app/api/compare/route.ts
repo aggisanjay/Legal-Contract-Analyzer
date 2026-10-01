@@ -3,6 +3,8 @@ import { prisma } from '@/lib/prisma';
 import { compareContracts } from '@/lib/compare/comparison-engine';
 
 export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
