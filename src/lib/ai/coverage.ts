@@ -1,5 +1,11 @@
 import { prisma } from '../prisma';
-import { retrieveChunksForDocument, RetrievedChunk } from './retriever';
+import {
+  retrieveChunksForDocument,
+  RetrievedChunk,
+  scoreChunksWithBM25,
+  extractHeadingLines,
+  tokenizeAndStem,
+} from './retriever';
 import { aiClient } from './client';
 import { formatPageRanges } from '../utils/format';
 export { formatPageRanges };
@@ -27,9 +33,23 @@ export interface CoverageReport {
   }>;
 }
 
+export interface TargetedChunkResult {
+  id: string;
+  chunkIndex: number;
+  text: string;
+  pageStart: number;
+  pageEnd: number;
+  score: number;
+  isPrimary: boolean;
+  sectionNumber?: number | string | null;
+  sectionTitle?: string | null;
+  startOffset?: number;
+  endOffset?: number;
+}
+
 export interface RetrievalResult {
   evidenceText: string;
-  chunks: Array<{ id: string; text: string; pageStart: number; pageEnd: number }>;
+  chunks: TargetedChunkResult[];
   coverage: CoverageReport;
   emptyAndIncomplete?: boolean;
   incompleteMessage?: string;
@@ -322,28 +342,103 @@ export function resolveDocumentFromAlias(
 }
 
 /**
- * Strategy A: Targeted Question Retrieval with Top-K scaling and neighbor chunks (±1).
+ * Deduplicates overlapping text between a primary chunk and its neighbour (the chunker uses a 150-character overlap)
+ * so the same sentence is not sent twice.
+ */
+export function deduplicateChunkOverlap(prevText: string, currText: string, maxOverlap = 300): string {
+  if (!prevText || !currText) return currText;
+  const prevTrimmed = prevText.trim();
+  const currTrimmed = currText.trim();
+  const searchLen = Math.min(prevTrimmed.length, currTrimmed.length, maxOverlap);
+  for (let len = searchLen; len >= 20; len--) {
+    const prevSuffix = prevTrimmed.slice(-len);
+    if (currTrimmed.startsWith(prevSuffix)) {
+      return currTrimmed.slice(len).trimStart();
+    }
+  }
+  return currTrimmed;
+}
+
+/**
+ * Formats section heading and page number on evidence blocks,
+ * e.g. [DOC_1 | Page 112 | Article 55 — Limitation of Liability]
+ */
+export function formatChunkHeading(
+  alias: string,
+  chunk: {
+    pageStart: number;
+    sectionNumber?: number | string | null;
+    sectionTitle?: string | null;
+    text: string;
+  }
+): string {
+  let heading = '';
+  if (chunk.sectionTitle) {
+    if (chunk.sectionNumber) {
+      heading = `Article ${chunk.sectionNumber} — ${chunk.sectionTitle}`;
+    } else {
+      heading = chunk.sectionTitle;
+    }
+  } else {
+    const extracted = extractHeadingLines(chunk.text);
+    if (extracted.length > 0) {
+      heading = extracted[0].replace(/^(?:ARTICLE|SECTION|CLAUSE|\d+)\s*[:.-]?\s*/i, '').trim() || extracted[0];
+    }
+  }
+  if (!heading) {
+    heading = 'General Provisions';
+  }
+  return `[${alias} | Page ${chunk.pageStart} | ${heading}]`;
+}
+
+export interface TargetedRetrievalOptions {
+  maxPrimaryHits?: number;
+  minScoreRatio?: number;
+  isMultiDoc?: boolean;
+  allChunks?: Array<{
+    id: string;
+    chunkIndex: number;
+    text: string;
+    pageStart: number;
+    pageEnd: number;
+    startOffset?: number;
+    endOffset?: number;
+    sectionNumber?: number | string | null;
+    sectionTitle?: string | null;
+    embedding?: any;
+    score?: number;
+  }>;
+}
+
+/**
+ * Strategy A: Targeted Question Retrieval returning chunks in RELEVANCE order:
+ * each primary hit in score order, with its ±1 neighbours placed immediately after it (deduplicated).
+ * Does NOT sort by chunkIndex before truncation.
  */
 export async function executeTargetedRetrieval(
   documentId: string,
   question: string,
-  totalPageCount: number
+  totalPageCount: number,
+  options?: TargetedRetrievalOptions
 ): Promise<RetrievalResult> {
-  const allChunks = await prisma.documentChunk.findMany({
-    where: { documentId },
-    orderBy: { chunkIndex: 'asc' },
-    select: {
-      id: true,
-      chunkIndex: true,
-      text: true,
-      pageStart: true,
-      pageEnd: true,
-      startOffset: true,
-      endOffset: true,
-      sectionNumber: true,
-      sectionTitle: true,
-    },
-  });
+  const allChunks =
+    options?.allChunks ||
+    (await prisma.documentChunk.findMany({
+      where: { documentId },
+      orderBy: { chunkIndex: 'asc' },
+      select: {
+        id: true,
+        chunkIndex: true,
+        text: true,
+        pageStart: true,
+        pageEnd: true,
+        startOffset: true,
+        endOffset: true,
+        sectionNumber: true,
+        sectionTitle: true,
+        embedding: true,
+      },
+    }));
 
   const totalChunks = allChunks.length;
   if (totalChunks === 0) {
@@ -361,34 +456,104 @@ export async function executeTargetedRetrieval(
     };
   }
 
-  // Top-K scales with doc size (min 8)
-  const topK = Math.max(8, Math.min(25, Math.ceil(totalChunks * 0.12)));
-  const primaryRetrieved = await retrieveChunksForDocument(documentId, question, topK);
+  const isMultiDoc = options?.isMultiDoc ?? false;
+  // Reduce over-retrieval: for multi-doc use at most 6 primary hits per document (plus neighbours)
+  const maxPrimaryHits = options?.maxPrimaryHits ?? (isMultiDoc ? 6 : Math.max(8, Math.min(25, Math.ceil(totalChunks * 0.12))));
+  const minScoreRatio = options?.minScoreRatio ?? 0.25;
+
+  let scoredAll: Array<{
+    id: string;
+    chunkIndex: number;
+    text: string;
+    pageStart: number;
+    pageEnd: number;
+    score: number;
+    sectionNumber?: number | string | null;
+    sectionTitle?: string | null;
+    startOffset?: number;
+    endOffset?: number;
+  }> = [];
+
+  if (options?.allChunks) {
+    scoredAll = scoreChunksWithBM25(options.allChunks as any, question);
+  } else {
+    scoredAll = await retrieveChunksForDocument(documentId, question, Math.max(maxPrimaryHits * 3, 20));
+  }
+
+  // Drop primary hits whose normalized score is below 25% of the best score, so weak matches don't fill the budget
+  const bestScore = scoredAll.length > 0 ? scoredAll[0].score : 0;
+  const filteredPrimary = scoredAll
+    .filter((p) => (bestScore > 0 ? p.score / bestScore >= minScoreRatio : true))
+    .slice(0, maxPrimaryHits);
 
   // Add neighbor chunks (±1)
-  const chunkIndexMap = new Map<number, typeof allChunks[0]>();
+  const chunkIndexMap = new Map<number, (typeof allChunks)[0]>();
   for (const c of allChunks) {
     chunkIndexMap.set(c.chunkIndex, c);
   }
 
   const selectedChunkIds = new Set<string>();
-  const finalChunks: typeof allChunks = [];
+  const finalChunks: TargetedChunkResult[] = [];
 
-  for (const p of primaryRetrieved) {
-    const indicesToAdd = [p.chunkIndex - 1, p.chunkIndex, p.chunkIndex + 1];
-    for (const idx of indicesToAdd) {
-      const neighbor = chunkIndexMap.get(idx);
-      if (neighbor && !selectedChunkIds.has(neighbor.id)) {
-        selectedChunkIds.add(neighbor.id);
-        finalChunks.push(neighbor);
-      }
+  // Order by relevance: each primary hit in score order, with its ±1 neighbours placed immediately after it
+  for (const p of filteredPrimary) {
+    if (!selectedChunkIds.has(p.id)) {
+      selectedChunkIds.add(p.id);
+      finalChunks.push({
+        id: p.id,
+        chunkIndex: p.chunkIndex,
+        text: p.text,
+        pageStart: p.pageStart,
+        pageEnd: p.pageEnd,
+        score: p.score,
+        isPrimary: true,
+        sectionNumber: p.sectionNumber,
+        sectionTitle: p.sectionTitle,
+        startOffset: p.startOffset,
+        endOffset: p.endOffset,
+      });
+    }
+
+    const leftNeighbor = chunkIndexMap.get(p.chunkIndex - 1);
+    if (leftNeighbor && !selectedChunkIds.has(leftNeighbor.id)) {
+      selectedChunkIds.add(leftNeighbor.id);
+      finalChunks.push({
+        id: leftNeighbor.id,
+        chunkIndex: leftNeighbor.chunkIndex,
+        text: leftNeighbor.text,
+        pageStart: leftNeighbor.pageStart,
+        pageEnd: leftNeighbor.pageEnd,
+        score: p.score * 0.5,
+        isPrimary: false,
+        sectionNumber: leftNeighbor.sectionNumber,
+        sectionTitle: leftNeighbor.sectionTitle,
+        startOffset: leftNeighbor.startOffset,
+        endOffset: leftNeighbor.endOffset,
+      });
+    }
+
+    const rightNeighbor = chunkIndexMap.get(p.chunkIndex + 1);
+    if (rightNeighbor && !selectedChunkIds.has(rightNeighbor.id)) {
+      selectedChunkIds.add(rightNeighbor.id);
+      finalChunks.push({
+        id: rightNeighbor.id,
+        chunkIndex: rightNeighbor.chunkIndex,
+        text: rightNeighbor.text,
+        pageStart: rightNeighbor.pageStart,
+        pageEnd: rightNeighbor.pageEnd,
+        score: p.score * 0.5,
+        isPrimary: false,
+        sectionNumber: rightNeighbor.sectionNumber,
+        sectionTitle: rightNeighbor.sectionTitle,
+        startOffset: rightNeighbor.startOffset,
+        endOffset: rightNeighbor.endOffset,
+      });
     }
   }
 
-  // Sort by document chunkIndex order
-  finalChunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+  // Do NOT sort finalChunks by chunkIndex before truncation! Keep relevance order.
 
-  // Compute examined pages
+  // Compute examined pages from finalChunks
   const examinedPages = new Set<number>();
   for (const c of finalChunks) {
     for (let p = c.pageStart; p <= c.pageEnd; p++) {
@@ -400,18 +565,15 @@ export async function executeTargetedRetrieval(
   const pagesExamined = examinedPages.size;
   const coveragePercent = Math.min(100, Math.round((pagesExamined / pagesTotal) * 100));
 
-  const evidenceText = finalChunks
+  // Display evidence text sorted by chunkIndex for single-doc callers
+  const displayChunks = [...finalChunks].sort((a, b) => a.chunkIndex - b.chunkIndex);
+  const evidenceText = displayChunks
     .map((c, i) => `[Evidence ${i + 1} - ChunkID: ${c.id} - Page ${c.pageStart}]\n${c.text}`)
     .join('\n\n');
 
   return {
     evidenceText,
-    chunks: finalChunks.map((c) => ({
-      id: c.id,
-      text: c.text,
-      pageStart: c.pageStart,
-      pageEnd: c.pageEnd,
-    })),
+    chunks: finalChunks,
     coverage: {
       chunksExamined: finalChunks.length,
       chunksTotal: totalChunks,
@@ -423,6 +585,141 @@ export async function executeTargetedRetrieval(
       incomplete: pagesExamined < pagesTotal,
     },
   };
+}
+
+export interface BuildMultiDocEvidenceItem {
+  id: string;
+  name: string;
+  alias: string;
+  index: number;
+  evidence: string;
+  pageCount: number;
+  pagesExamined: number[];
+  chunks: TargetedChunkResult[];
+  topChunkText?: string;
+  isMapReduced?: boolean;
+  summary: string;
+  droppedCount: number;
+  retrievedCount: number;
+}
+
+/**
+ * Assembles fair-share evidence for a single document in multi-doc mode:
+ * - Budget cut by relevance (takes chunks in relevance order, always keeps top 3 primary hits)
+ * - Computes honest coverage from fairChunks
+ * - Sorts surviving chunks by chunkIndex for display with headers and overlap deduplication
+ */
+export function assembleMultiDocEvidenceForDoc(params: {
+  doc: { id: string; originalFilename: string; pageCount: number };
+  alias: string;
+  index: number;
+  retrievedChunks: TargetedChunkResult[];
+  fairShareChars: number;
+  isMapReduced?: boolean;
+}): BuildMultiDocEvidenceItem {
+  const { doc, alias, index, retrievedChunks, fairShareChars, isMapReduced } = params;
+
+  const primaryHits = retrievedChunks.filter((c) => c.isPrimary);
+  const top3Primary = primaryHits.slice(0, 3);
+  const top3PrimaryIds = new Set(top3Primary.map((c) => c.id));
+
+  const top3Chars = top3Primary.reduce((acc, c) => acc + c.text.length, 0);
+  const remainingBudget = Math.max(0, fairShareChars - top3Chars);
+
+  const fairChunks: TargetedChunkResult[] = [];
+  let otherChars = 0;
+
+  for (const c of retrievedChunks) {
+    if (top3PrimaryIds.has(c.id)) {
+      // Always include every primary hit in top 3 even if budget is exceeded
+      fairChunks.push(c);
+    } else {
+      if (otherChars + c.text.length <= remainingBudget) {
+        fairChunks.push(c);
+        otherChars += c.text.length;
+      } else if (otherChars < remainingBudget && remainingBudget - otherChars >= 200) {
+        const sliceLen = remainingBudget - otherChars;
+        fairChunks.push({
+          ...c,
+          text: c.text.slice(0, sliceLen) + '... [truncated]',
+        });
+        otherChars += sliceLen;
+      }
+    }
+  }
+
+  // Honest coverage: computed strictly from fairChunks
+  const examinedPagesSet = new Set<number>();
+  if (isMapReduced && fairChunks.length === 0) {
+    for (let p = 1; p <= doc.pageCount; p++) {
+      examinedPagesSet.add(p);
+    }
+  } else {
+    for (const c of fairChunks) {
+      for (let p = c.pageStart; p <= c.pageEnd; p++) {
+        examinedPagesSet.add(p);
+      }
+    }
+  }
+
+  const examinedPagesList = Array.from(examinedPagesSet).sort((a, b) => a - b);
+  const pCount = examinedPagesList.length;
+  const pFormatted = formatPageRanges(examinedPagesList);
+  const droppedCount = Math.max(0, retrievedChunks.length - fairChunks.length);
+  const shortName = doc.originalFilename.replace(/\.pdf$/i, '').replace(/^large-contract-/, '');
+
+  let summary = '';
+  if (isMapReduced && pCount >= doc.pageCount) {
+    summary = `${shortName}: read all ${doc.pageCount} of ${doc.pageCount} pages`;
+  } else if (droppedCount > 0) {
+    summary = `${shortName}: looked at pp. ${pFormatted} (${pCount} of ${doc.pageCount}; retrieved ${retrievedChunks.length} passages; ${droppedCount} were too long to include)`;
+  } else {
+    summary = `${shortName}: looked at pp. ${pFormatted} (${pCount} of ${doc.pageCount})`;
+  }
+
+  let evidence = '';
+  if (fairChunks.length > 0) {
+    const displayChunks = [...fairChunks].sort((a, b) => a.chunkIndex - b.chunkIndex);
+    const blocks: string[] = [];
+    let prevText = '';
+    for (const c of displayChunks) {
+      const dedupedText = deduplicateChunkOverlap(prevText, c.text);
+      prevText = c.text;
+      const heading = formatChunkHeading(alias, c);
+      blocks.push(`${heading}\n${dedupedText}`);
+    }
+    evidence = blocks.join('\n---\n');
+  } else {
+    evidence = `NO RELEVANT PASSAGES RETRIEVED FOR ${doc.originalFilename}`;
+  }
+
+  return {
+    id: doc.id,
+    name: doc.originalFilename,
+    alias,
+    index,
+    evidence,
+    pageCount: doc.pageCount,
+    pagesExamined: examinedPagesList,
+    chunks: fairChunks,
+    topChunkText: fairChunks[0]?.text,
+    isMapReduced,
+    summary,
+    droppedCount,
+    retrievedCount: retrievedChunks.length,
+  };
+}
+
+/**
+ * Builds the combined multi-doc prompt user message containing all document evidence blocks.
+ */
+export function buildMultiDocPrompt(question: string, docList: BuildMultiDocEvidenceItem[]): string {
+  return (
+    `QUESTION:\n${question}\n\nCONTRACTS EVIDENCE:\n` +
+    docList
+      .map((d) => `=== DOCUMENT ${d.index} (alias: ${d.alias}, file: ${d.name}) ===\n${d.evidence}`)
+      .join('\n\n')
+  );
 }
 
 /**
@@ -618,11 +915,16 @@ export async function executeMapReduceRetrieval(
 
   return {
     evidenceText,
-    chunks: collectedPassages.map((p) => ({
+    chunks: collectedPassages.map((p, idx) => ({
       id: p.chunkId,
+      chunkIndex: idx,
       text: p.text,
       pageStart: p.page,
       pageEnd: p.page,
+      score: 1.0,
+      isPrimary: true,
+      sectionNumber: null,
+      sectionTitle: null,
     })),
     coverage,
   };

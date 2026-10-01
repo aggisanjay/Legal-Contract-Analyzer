@@ -13,6 +13,10 @@ import {
   resolveDocumentFromAlias,
   isPlaceholderQuote,
   formatPageRanges,
+  assembleMultiDocEvidenceForDoc,
+  buildMultiDocPrompt,
+  BuildMultiDocEvidenceItem,
+  TargetedChunkResult,
 } from '@/lib/ai/coverage';
 import { CONTRACT_QA_SYSTEM_PROMPT, MULTI_DOC_QA_SYSTEM_PROMPT } from '@/lib/ai/prompts';
 import { runAgenticDocumentResearch } from '@/lib/ai/agent';
@@ -261,20 +265,12 @@ export async function POST(req: NextRequest) {
               new Set(tokenizeAndStem(`${topicQuery} ${question}`))
             );
 
-            const docEvidenceList: Array<{
-              id: string;
-              name: string;
-              alias: string;
-              index: number;
-              evidence: string;
-              pageCount: number;
-              pagesExamined: number[];
-              chunks: Array<{ id: string; text: string; pageStart: number; pageEnd: number }>;
-              topChunkText?: string;
-              isMapReduced?: boolean;
-            }> = [];
+            const docEvidenceList: BuildMultiDocEvidenceItem[] = [];
 
-            const fairShareChars = Math.floor(24000 / docIds.length);
+            const defaultBudget = 36000;
+            const envBudget = parseInt(process.env.MULTIDOC_EVIDENCE_CHARS || '', 10);
+            const totalBudgetChars = !isNaN(envBudget) && envBudget > 0 ? envBudget : defaultBudget;
+            const fairShareChars = Math.floor(totalBudgetChars / docIds.length);
 
             for (let i = 0; i < docIds.length; i++) {
               const dId = docIds[i];
@@ -286,13 +282,21 @@ export async function POST(req: NextRequest) {
 
               sendEvent('status', { message: `Searching "${doc.originalFilename}" for "${topicQuery}"...` });
 
-              // Retrieve with topicQuery (topK >= 8, neighbours ±1 inside executeTargetedRetrieval)
-              const resTopic = await executeTargetedRetrieval(dId, topicQuery, doc.pageCount);
-              let retrievedChunks = [...resTopic.chunks];
+              // Retrieve with topicQuery (at most 6 primary hits for multi-doc)
+              const resTopic = await executeTargetedRetrieval(dId, topicQuery, doc.pageCount, {
+                isMultiDoc: true,
+                maxPrimaryHits: 6,
+                minScoreRatio: 0.25,
+              });
+              let retrievedChunks: TargetedChunkResult[] = [...resTopic.chunks];
 
-              // Retrieve with original question and union results
+              // Retrieve with original question and union results in relevance order
               if (question.toLowerCase().trim() !== topicQuery.toLowerCase().trim()) {
-                const resOrig = await executeTargetedRetrieval(dId, question, doc.pageCount);
+                const resOrig = await executeTargetedRetrieval(dId, question, doc.pageCount, {
+                  isMultiDoc: true,
+                  maxPrimaryHits: 6,
+                  minScoreRatio: 0.25,
+                });
                 const seenIds = new Set(retrievedChunks.map((c) => c.id));
                 for (const c of resOrig.chunks) {
                   if (!seenIds.has(c.id)) {
@@ -302,7 +306,7 @@ export async function POST(req: NextRequest) {
                 }
               }
 
-              // Check if retrieved chunks contain any topic term (after stopword removal)
+              // Check if retrieved chunks contain any topic term (after stopword removal & stemming)
               let hasTopicTerm = false;
               if (retrievedChunks.length > 0) {
                 const combinedText = retrievedChunks.map((c) => c.text.toLowerCase()).join(' ');
@@ -311,9 +315,9 @@ export async function POST(req: NextRequest) {
               }
 
               let isMapReduced = false;
-              let examinedPagesList: number[] = [];
 
-              // Auto-escalate: if retrieved evidence does not contain any query topic term at all, run map-reduce
+              // Task 5: Before model call, check that at least one chunk contains a topic term.
+              // If none does, escalate to map-reduce for that document.
               if (!hasTopicTerm || retrievedChunks.length === 0) {
                 sendEvent('status', {
                   message: `Topic terms not found in targeted chunks for "${doc.originalFilename}". Escalating to full-document map-reduce review...`,
@@ -324,74 +328,40 @@ export async function POST(req: NextRequest) {
                   },
                 });
                 if (mrResult.chunks && mrResult.chunks.length > 0) {
-                  retrievedChunks = mrResult.chunks;
+                  retrievedChunks = mrResult.chunks.map((c, idx) => ({
+                    id: c.id,
+                    chunkIndex: (c as any).chunkIndex ?? idx,
+                    text: c.text,
+                    pageStart: c.pageStart,
+                    pageEnd: c.pageEnd,
+                    score: 1.0,
+                    isPrimary: true,
+                    sectionNumber: null,
+                    sectionTitle: null,
+                  }));
                 }
                 isMapReduced = true;
-                examinedPagesList = Array.from({ length: doc.pageCount }, (_, idx) => idx + 1);
-              } else {
-                const pSet = new Set<number>();
-                for (const c of retrievedChunks) {
-                  for (let p = c.pageStart; p <= c.pageEnd; p++) {
-                    pSet.add(p);
-                  }
-                }
-                examinedPagesList = Array.from(pSet).sort((a, b) => a - b);
               }
 
-              // Fair share truncation of evidence
-              let accLen = 0;
-              const fairChunks: typeof retrievedChunks = [];
-              for (const c of retrievedChunks) {
-                if (accLen + c.text.length <= fairShareChars || fairChunks.length === 0) {
-                  fairChunks.push(c);
-                  accLen += c.text.length;
-                } else {
-                  break;
-                }
-              }
-
-              let evidenceText = '';
-              if (fairChunks.length > 0) {
-                evidenceText = fairChunks.map((c) => `[Page ${c.pageStart}]\n${c.text}`).join('\n---\n');
-              } else {
-                evidenceText = `NO RELEVANT PASSAGES RETRIEVED FOR ${doc.originalFilename}`;
-              }
-
-              docEvidenceList.push({
-                id: doc.id,
-                name: doc.originalFilename,
+              const docEvidence = assembleMultiDocEvidenceForDoc({
+                doc: { id: doc.id, originalFilename: doc.originalFilename, pageCount: doc.pageCount },
                 alias: `DOC_${i + 1}`,
                 index: i + 1,
-                evidence: evidenceText,
-                pageCount: doc.pageCount,
-                pagesExamined: examinedPagesList,
-                chunks: fairChunks,
-                topChunkText: fairChunks[0]?.text,
+                retrievedChunks,
+                fairShareChars,
                 isMapReduced,
               });
+              docEvidenceList.push(docEvidence);
             }
 
             // Record per-document coverage and show it per document in coverage badge
-            const perDocSummaries: string[] = [];
-            let totalExaminedPages = 0;
-            let totalPages = 0;
+            const coverageSummary = docEvidenceList.map((d) => d.summary).join('. ');
+            const totalExaminedPages = docEvidenceList.reduce((acc, d) => acc + d.pagesExamined.length, 0);
+            const totalPages = docEvidenceList.reduce((acc, d) => acc + d.pageCount, 0);
             const allExaminedPagesSet = new Set<number>();
-
             for (const d of docEvidenceList) {
-              const shortName = d.name.replace(/\.pdf$/i, '').replace(/^large-contract-/, '');
-              const pCount = d.pagesExamined.length;
-              const pFormatted = formatPageRanges(d.pagesExamined);
-              if (d.isMapReduced && pCount >= d.pageCount) {
-                perDocSummaries.push(`${shortName}: read all ${d.pageCount} of ${d.pageCount} pages`);
-              } else {
-                perDocSummaries.push(`${shortName}: looked at pp. ${pFormatted} (${pCount} of ${d.pageCount})`);
-              }
-              totalExaminedPages += pCount;
-              totalPages += d.pageCount;
               for (const p of d.pagesExamined) allExaminedPagesSet.add(p);
             }
-
-            const coverageSummary = perDocSummaries.join('. ');
 
             sendEvent('coverage', {
               chunksExamined: docEvidenceList.reduce((acc, d) => acc + d.chunks.length, 0),
@@ -412,14 +382,7 @@ export async function POST(req: NextRequest) {
               },
               {
                 role: 'user' as const,
-                content:
-                  `QUESTION:\n${question}\n\nCONTRACTS EVIDENCE:\n` +
-                  docEvidenceList
-                    .map(
-                      (d) =>
-                        `=== DOCUMENT ${d.index} (alias: ${d.alias}, file: ${d.name}) ===\n${d.evidence}`
-                    )
-                    .join('\n\n'),
+                content: buildMultiDocPrompt(question, docEvidenceList),
               },
             ];
 
@@ -455,6 +418,71 @@ export async function POST(req: NextRequest) {
             const flushed = parser.flush();
             fullGeneratedText = flushed.prose;
             quotesJsonBuffer = flushed.quotesJson;
+
+            // Task 5: Post-model guardrail against false "not found"
+            const isClaimingNoPassage =
+              /no\s+relevant\s+passage/i.test(fullGeneratedText) ||
+              /not\s+found\s+in/i.test(fullGeneratedText) ||
+              /could\s+not\s+find/i.test(fullGeneratedText);
+
+            if (isClaimingNoPassage) {
+              for (const d of docEvidenceList) {
+                const hasTopicInPrompt = d.chunks.some((c) => {
+                  const tokens = tokenizeAndStem(c.text);
+                  const textLower = c.text.toLowerCase();
+                  return topicTerms.some((t) => tokens.includes(t) || textLower.includes(t));
+                });
+
+                if (hasTopicInPrompt && d.chunks.length > 0) {
+                  console.warn(
+                    `[multi-doc] Attempt 1 failed for ${d.name} (${d.alias}): Model claimed no relevant passage, but prompt contained topic chunks. Retrying with top 2 chunks...`
+                  );
+                  const top2Chunks = d.chunks.slice(0, 2);
+                  const top2Text = top2Chunks
+                    .map((c) => `[${d.alias} | Page ${c.pageStart}]\n${c.text}`)
+                    .join('\n\n');
+
+                  try {
+                    const retryRes = await aiClient.createChatCompletion({
+                      messages: [
+                        {
+                          role: 'system',
+                          content:
+                            `Answer the question from these passages only. Specify the answer clearly and directly. ` +
+                            `After your answer, output <<<QUOTES>>> followed by a JSON object with citations: ` +
+                            `{"citations": [{"id": 1, "doc": "${d.alias}", "quote": "exact sentence verbatim"}]}`,
+                        },
+                        {
+                          role: 'user',
+                          content: `QUESTION:\n${question}\n\nPASSAGES FROM ${d.name} (${d.alias}):\n${top2Text}`,
+                        },
+                      ],
+                      temperature: 0,
+                    });
+
+                    console.log(`[multi-doc] Attempt 2 response for ${d.name}:`, retryRes.content);
+                    if (retryRes.content && retryRes.content.trim().length > 0) {
+                      const retryProse = cleanAnswerPreambleAndSeparators(retryRes.content);
+                      fullGeneratedText += `\n\n**${d.name}:**\n${retryProse}`;
+                      sendEvent('token', { text: `\n\n${retryProse}` });
+
+                      const delimIdx =
+                        retryRes.content.indexOf(MACHINE_DELIMITER) !== -1
+                          ? retryRes.content.indexOf(MACHINE_DELIMITER) + MACHINE_DELIMITER.length
+                          : retryRes.content.indexOf(LEGACY_DELIMITER) !== -1
+                          ? retryRes.content.indexOf(LEGACY_DELIMITER) + LEGACY_DELIMITER.length
+                          : -1;
+
+                      if (delimIdx !== -1) {
+                        quotesJsonBuffer += '\n' + retryRes.content.slice(delimIdx);
+                      }
+                    }
+                  } catch (err) {
+                    console.warn(`[multi-doc] Attempt 2 retry failed for ${d.name}:`, err);
+                  }
+                }
+              }
+            }
 
             const completionTime = Date.now();
             console.log(
