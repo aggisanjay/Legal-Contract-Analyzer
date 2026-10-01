@@ -93,7 +93,7 @@ describe('Bug 2 - Multi-Document Quotes Verification & Alias Resolution', () => 
 
     expect(resV1.verified).toBe(true);
     if (resV1.verified) {
-      expect(resV1.pageStart).toBe(112);
+      expect(resV1.pageStart).toBe(38);
     }
 
     // Verify v2 quote on v2
@@ -111,7 +111,7 @@ describe('Bug 2 - Multi-Document Quotes Verification & Alias Resolution', () => 
 
     expect(resV2.verified).toBe(true);
     if (resV2.verified) {
-      expect(resV2.pageStart).toBe(112);
+      expect(resV2.pageStart).toBe(38);
     }
 
     // Cross-check: v1 quote MUST FAIL on v2
@@ -192,8 +192,8 @@ describe('Bug 2 - Multi-Document Quotes Verification & Alias Resolution', () => 
     }
 
     expect(verifiedResults.length).toBe(2);
-    expect(verifiedResults[0]).toEqual({ id: 1, docId: 'db_id_v1', page: 112 });
-    expect(verifiedResults[1]).toEqual({ id: 2, docId: 'db_id_v2', page: 112 });
+    expect(verifiedResults[0]).toEqual({ id: 1, docId: 'db_id_v1', page: 38 });
+    expect(verifiedResults[1]).toEqual({ id: 2, docId: 'db_id_v2', page: 38 });
 
     expect(unverifiedResults.length).toBe(1);
     expect(unverifiedResults[0].id).toBe(3);

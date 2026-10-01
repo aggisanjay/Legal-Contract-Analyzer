@@ -16,6 +16,15 @@ export interface CoverageReport {
   unreadPages?: number[];
   searchedPagesDesc?: string;
   unreadPagesDesc?: string;
+  summary?: string;
+  documentCoverages?: Array<{
+    documentId: string;
+    documentName: string;
+    alias: string;
+    pagesExamined: number[];
+    pagesTotal: number;
+    summary: string;
+  }>;
 }
 
 export interface RetrievalResult {
@@ -204,6 +213,24 @@ export function parseQuotesPayload(
   }
 
   return { answerType, citations };
+}
+
+/**
+ * Checks whether a candidate quote is a "not found" placeholder or missing marker.
+ * Placeholders must be discarded before verification and never shown as unverifiable quotes.
+ */
+export function isPlaceholderQuote(quote: string | undefined | null): boolean {
+  if (!quote) return true;
+  const q = quote.trim().toLowerCase();
+  return (
+    q.startsWith('not found') ||
+    q.startsWith('no relevant passage') ||
+    q.includes('no relevant passages retrieved') ||
+    q.includes('not found in') ||
+    /^n\/?a\b/i.test(q) ||
+    /^none\b/i.test(q) ||
+    /^no\s+clause\b/i.test(q)
+  );
 }
 
 export interface DocumentCandidateRef {

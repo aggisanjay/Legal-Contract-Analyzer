@@ -853,9 +853,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                             : undefined
                         }
                       >
-                        {msg.coverage.pagesExamined >= msg.coverage.pagesTotal &&
-                        !msg.coverage.incomplete &&
-                        msg.coverage.strategy === 'map-reduce'
+                        {msg.coverage.summary
+                          ? msg.coverage.strategy === 'map-reduce' && !msg.coverage.incomplete
+                            ? msg.coverage.summary
+                            : `${msg.coverage.summary}. Not an exhaustive read.`
+                          : msg.coverage.pagesExamined >= msg.coverage.pagesTotal &&
+                            !msg.coverage.incomplete &&
+                            msg.coverage.strategy === 'map-reduce'
                           ? `Read all ${msg.coverage.pagesTotal} of ${msg.coverage.pagesTotal} pages`
                           : `Looked at ${
                               msg.coverage.pagesExaminedList && msg.coverage.pagesExaminedList.length > 0
@@ -1111,9 +1115,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                               <span className="text-amber-900 font-semibold truncate text-right">
                                 {uCit.reason === 'unknown document'
                                   ? 'Unknown document'
+                                  : uCit.reason === 'placeholder'
+                                  ? 'Placeholder'
+                                  : uCit.reason === 'not found in text'
+                                  ? 'Not found in text'
                                   : uCit.reason
                                   ? uCit.reason
-                                  : `Quote not found in ${uCit.documentName || 'contract'} verbatim`}
+                                  : 'Not found in text'}
                               </span>
                             </div>
                             <p className="font-serif italic text-slate-600 line-clamp-2">

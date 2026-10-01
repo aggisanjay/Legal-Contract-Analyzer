@@ -130,6 +130,28 @@ export async function generateBenchmark150PageContract(
         size: 10,
         font,
       });
+    } else if (pageNum === 38) {
+      // Page 38: Article 38 Termination for Convenience
+      page.drawText('ARTICLE 38. TERMINATION FOR CONVENIENCE', {
+        x: 50,
+        y,
+        size: 12,
+        font: boldFont,
+      });
+      y -= 25;
+      page.drawText(`Either party may terminate this Agreement for convenience by providing ${options.noticeDays} days' written notice.`, {
+        x: 50,
+        y,
+        size: 10,
+        font,
+      });
+      y -= 20;
+      page.drawText('Upon termination, provider shall promptly cease all operations and return materials.', {
+        x: 50,
+        y,
+        size: 10,
+        font,
+      });
     } else if (pageNum === 112) {
       // Page 112: Article 55 containing Limitation of Liability
       page.drawText('ARTICLE 55. LIMITATION OF LIABILITY AND REMEDIES', {
@@ -153,8 +175,23 @@ export async function generateBenchmark150PageContract(
         size: 10,
         font,
       });
+    } else if (pageNum === 116) {
+      // Page 116: Article 116 Governing Law
+      page.drawText('ARTICLE 116. GOVERNING LAW AND JURISDICTION', {
+        x: 50,
+        y,
+        size: 12,
+        font: boldFont,
+      });
       y -= 25;
-      page.drawText(`Either party may terminate this Agreement for convenience by providing ${options.noticeDays} days' written notice.`, {
+      page.drawText('This Agreement shall be governed by and construed in accordance with the laws of the Emirate of Dubai and the federal laws of the United Arab Emirates.', {
+        x: 50,
+        y,
+        size: 10,
+        font,
+      });
+      y -= 20;
+      page.drawText('The courts of Dubai shall have exclusive jurisdiction over any dispute arising under this Agreement.', {
         x: 50,
         y,
         size: 10,

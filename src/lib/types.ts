@@ -108,6 +108,15 @@ export interface CoverageInfo {
   unreadPages?: number[];
   searchedPagesDesc?: string;
   unreadPagesDesc?: string;
+  summary?: string;
+  documentCoverages?: Array<{
+    documentId: string;
+    documentName: string;
+    alias: string;
+    pagesExamined: number[];
+    pagesTotal: number;
+    summary: string;
+  }>;
 }
 
 export interface AgentTimelineStep {

@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { aiClient, AIUnavailableError } from '@/lib/ai/client';
-import { retrieveChunksForDocument } from '@/lib/ai/retriever';
+import { retrieveChunksForDocument, STOPWORDS, lightStem, tokenizeAndStem } from '@/lib/ai/retriever';
 import {
   isExhaustiveQuestion,
   isComparativeQuestion,
@@ -11,6 +11,8 @@ import {
   isAbsenceClaim,
   parseQuotesPayload,
   resolveDocumentFromAlias,
+  isPlaceholderQuote,
+  formatPageRanges,
 } from '@/lib/ai/coverage';
 import { CONTRACT_QA_SYSTEM_PROMPT, MULTI_DOC_QA_SYSTEM_PROMPT } from '@/lib/ai/prompts';
 import { runAgenticDocumentResearch } from '@/lib/ai/agent';
@@ -218,6 +220,54 @@ export async function POST(req: NextRequest) {
             // --- Multi-Document Analysis ---
             sendEvent('status', { message: `Retrieving evidence across ${docIds.length} contracts...` });
 
+            // 1. Derive topicQuery for multi-doc/comparison questions
+            let topicQuery = '';
+            const fallbackTerms = question
+              .toLowerCase()
+              .replace(/[^\w\s]/g, ' ')
+              .split(/\s+/)
+              .filter((w) => w.length > 1 && !STOPWORDS.has(w));
+            const fallbackTopic = fallbackTerms.join(' ');
+
+            try {
+              const rewriteRes = await aiClient.createChatCompletion({
+                messages: [
+                  {
+                    role: 'system',
+                    content:
+                      'Rewrite this question as a short search query naming ONLY the legal topic, no comparison words. Return JSON: {"topicQuery": "..."}',
+                  },
+                  {
+                    role: 'user',
+                    content: question,
+                  },
+                ],
+                temperature: 0,
+                responseFormatJson: true,
+              });
+              const parsedRewrite = JSON.parse(rewriteRes.content || '{}');
+              if (parsedRewrite.topicQuery && typeof parsedRewrite.topicQuery === 'string' && parsedRewrite.topicQuery.trim().length > 0) {
+                topicQuery = parsedRewrite.topicQuery.trim();
+              }
+            } catch (err) {
+              console.warn('[multi-doc] Topic query derivation via LLM failed, using fallback:', err);
+            }
+
+            if (!topicQuery) {
+              topicQuery = fallbackTopic || question;
+            }
+
+            const topicTerms = Array.from(
+              new Set(
+                `${topicQuery} ${question}`
+                  .toLowerCase()
+                  .replace(/[^\w\s]/g, ' ')
+                  .split(/\s+/)
+                  .filter((w) => w.length > 1 && !STOPWORDS.has(w))
+                  .map((w) => lightStem(w))
+              )
+            );
+
             const docEvidenceList: Array<{
               id: string;
               name: string;
@@ -225,7 +275,13 @@ export async function POST(req: NextRequest) {
               index: number;
               evidence: string;
               pageCount: number;
+              pagesExamined: number[];
+              chunks: Array<{ id: string; text: string; pageStart: number; pageEnd: number }>;
+              topChunkText?: string;
+              isMapReduced?: boolean;
             }> = [];
+
+            const fairShareChars = Math.floor(24000 / docIds.length);
 
             for (let i = 0; i < docIds.length; i++) {
               const dId = docIds[i];
@@ -235,21 +291,126 @@ export async function POST(req: NextRequest) {
               });
               if (!doc) continue;
 
-              sendEvent('status', { message: `Searching "${doc.originalFilename}"...` });
-              const chunks = await retrieveChunksForDocument(dId, question, 6);
-              const text = chunks.length > 0
-                ? chunks.map((c) => `[Page ${c.pageStart}]\n${c.text}`).join('\n---\n')
-                : `Not found in ${doc.originalFilename}`;
+              sendEvent('status', { message: `Searching "${doc.originalFilename}" for "${topicQuery}"...` });
+
+              // Retrieve with topicQuery (topK >= 8, neighbours ±1 inside executeTargetedRetrieval)
+              const resTopic = await executeTargetedRetrieval(dId, topicQuery, doc.pageCount);
+              let retrievedChunks = [...resTopic.chunks];
+
+              // Retrieve with original question and union results
+              if (question.toLowerCase().trim() !== topicQuery.toLowerCase().trim()) {
+                const resOrig = await executeTargetedRetrieval(dId, question, doc.pageCount);
+                const seenIds = new Set(retrievedChunks.map((c) => c.id));
+                for (const c of resOrig.chunks) {
+                  if (!seenIds.has(c.id)) {
+                    seenIds.add(c.id);
+                    retrievedChunks.push(c);
+                  }
+                }
+              }
+
+              // Check if retrieved chunks contain any topic term (after stopword removal)
+              let hasTopicTerm = false;
+              if (retrievedChunks.length > 0) {
+                const combinedText = retrievedChunks.map((c) => c.text.toLowerCase()).join(' ');
+                const combinedStemmed = new Set(tokenizeAndStem(combinedText));
+                hasTopicTerm = topicTerms.some((t) => combinedStemmed.has(t) || combinedText.includes(t));
+              }
+
+              let isMapReduced = false;
+              let examinedPagesList: number[] = [];
+
+              // Auto-escalate: if retrieved evidence does not contain any query topic term at all, run map-reduce
+              if (!hasTopicTerm || retrievedChunks.length === 0) {
+                sendEvent('status', {
+                  message: `Topic terms not found in targeted chunks for "${doc.originalFilename}". Escalating to full-document map-reduce review...`,
+                });
+                const mrResult = await executeMapReduceRetrieval(dId, question, doc.pageCount, {
+                  onProgress: (msg) => {
+                    sendEvent('status', { message: `[${doc.originalFilename}] ${msg}` });
+                  },
+                });
+                if (mrResult.chunks && mrResult.chunks.length > 0) {
+                  retrievedChunks = mrResult.chunks;
+                }
+                isMapReduced = true;
+                examinedPagesList = Array.from({ length: doc.pageCount }, (_, idx) => idx + 1);
+              } else {
+                const pSet = new Set<number>();
+                for (const c of retrievedChunks) {
+                  for (let p = c.pageStart; p <= c.pageEnd; p++) {
+                    pSet.add(p);
+                  }
+                }
+                examinedPagesList = Array.from(pSet).sort((a, b) => a - b);
+              }
+
+              // Fair share truncation of evidence
+              let accLen = 0;
+              const fairChunks: typeof retrievedChunks = [];
+              for (const c of retrievedChunks) {
+                if (accLen + c.text.length <= fairShareChars || fairChunks.length === 0) {
+                  fairChunks.push(c);
+                  accLen += c.text.length;
+                } else {
+                  break;
+                }
+              }
+
+              let evidenceText = '';
+              if (fairChunks.length > 0) {
+                evidenceText = fairChunks.map((c) => `[Page ${c.pageStart}]\n${c.text}`).join('\n---\n');
+              } else {
+                evidenceText = `NO RELEVANT PASSAGES RETRIEVED FOR ${doc.originalFilename}`;
+              }
 
               docEvidenceList.push({
                 id: doc.id,
                 name: doc.originalFilename,
                 alias: `DOC_${i + 1}`,
                 index: i + 1,
-                evidence: text,
+                evidence: evidenceText,
                 pageCount: doc.pageCount,
+                pagesExamined: examinedPagesList,
+                chunks: fairChunks,
+                topChunkText: fairChunks[0]?.text,
+                isMapReduced,
               });
             }
+
+            // Record per-document coverage and show it per document in coverage badge
+            const perDocSummaries: string[] = [];
+            let totalExaminedPages = 0;
+            let totalPages = 0;
+            const allExaminedPagesSet = new Set<number>();
+
+            for (const d of docEvidenceList) {
+              const shortName = d.name.replace(/\.pdf$/i, '').replace(/^large-contract-/, '');
+              const pCount = d.pagesExamined.length;
+              const pFormatted = formatPageRanges(d.pagesExamined);
+              if (d.isMapReduced && pCount >= d.pageCount) {
+                perDocSummaries.push(`${shortName}: read all ${d.pageCount} of ${d.pageCount} pages`);
+              } else {
+                perDocSummaries.push(`${shortName}: looked at pp. ${pFormatted} (${pCount} of ${d.pageCount})`);
+              }
+              totalExaminedPages += pCount;
+              totalPages += d.pageCount;
+              for (const p of d.pagesExamined) allExaminedPagesSet.add(p);
+            }
+
+            const coverageSummary = perDocSummaries.join('. ');
+
+            sendEvent('coverage', {
+              chunksExamined: docEvidenceList.reduce((acc, d) => acc + d.chunks.length, 0),
+              chunksTotal: docEvidenceList.reduce((acc, d) => acc + (d.chunks.length || 1), 0),
+              pagesExamined: totalExaminedPages,
+              pagesTotal: totalPages,
+              pagesExaminedList: Array.from(allExaminedPagesSet).sort((a, b) => a - b),
+              strategy: docEvidenceList.every((d) => d.isMapReduced) ? 'map-reduce' : 'targeted',
+              coveragePercent: Math.min(100, Math.round((totalExaminedPages / totalPages) * 100)),
+              incomplete: docEvidenceList.some((d) => !d.isMapReduced || d.pagesExamined.length < d.pageCount),
+              summary: coverageSummary,
+            });
 
             const promptMessages = [
               {
@@ -315,6 +476,9 @@ export async function POST(req: NextRequest) {
             let parsedPayload = parseQuotesPayload(quotesJsonBuffer, 'comparison');
             let candidateCitations = parsedPayload.citations;
 
+            // Discard candidate quotes that start with "Not found" or match placeholder patterns before verification
+            candidateCitations = candidateCitations.filter((cand) => !isPlaceholderQuote(cand.quote));
+
             // If no citations parsed, attempt quick fallback repair
             if (candidateCitations.length === 0 && quotesJsonBuffer.trim().length > 0) {
               try {
@@ -330,7 +494,7 @@ export async function POST(req: NextRequest) {
                   temperature: 0,
                 });
                 parsedPayload = parseQuotesPayload(repair.content || '', 'comparison');
-                candidateCitations = parsedPayload.citations;
+                candidateCitations = parsedPayload.citations.filter((cand) => !isPlaceholderQuote(cand.quote));
               } catch {
                 sendEvent('notice', { message: 'No verifiable quotes could be produced.' });
               }
@@ -339,7 +503,7 @@ export async function POST(req: NextRequest) {
             const seenQuoteKeys = new Set<string>();
             for (let i = 0; i < candidateCitations.length; i++) {
               const cand = candidateCitations[i];
-              if (!cand.quote) continue;
+              if (!cand.quote || isPlaceholderQuote(cand.quote)) continue;
 
               const targetDocInfo = resolveDocumentFromAlias(cand.doc || cand.documentId, docEvidenceList);
               if (!targetDocInfo) {
@@ -386,7 +550,7 @@ export async function POST(req: NextRequest) {
                 sendEvent('citation', cit);
               } else {
                 console.log(
-                  `[quote-verify] Doc ${cand.doc || targetDocInfo.name} quote rejected: ${vResult.reason} in ${targetDocInfo.name} (normalized quote length: ${cand.quote.trim().length})`
+                  `[quote-verify] Doc ${cand.doc || targetDocInfo.name} quote rejected: ${vResult.reason} in ${targetDocInfo.name}`
                 );
                 const unv = {
                   id: `unv_${Date.now()}_${i}`,
@@ -394,7 +558,7 @@ export async function POST(req: NextRequest) {
                   documentName: targetDocInfo.name,
                   quote: cand.quote,
                   verified: false as const,
-                  reason: vResult.reason,
+                  reason: vResult.reason || 'not found in text',
                   citationNumber: cand.id || i + 1,
                 };
                 collectedUnverified.push(unv);
@@ -402,66 +566,74 @@ export async function POST(req: NextRequest) {
               }
             }
 
-            // Multi-doc quote repair pass:
-            // When candidate quotes were emitted but ALL of them failed verification,
-            // make a single quick repair call to re-quote verbatim from the evidence passages.
-            if (collectedCitations.length === 0 && candidateCitations.length > 0) {
+            // Task 4: Fallback retry when all candidate quotes fail in multi-doc path
+            if (collectedCitations.length === 0) {
               try {
-                sendEvent('status', { message: 'Re-quoting verbatim from contracts evidence...' });
-                const combinedEvidence = docEvidenceList
+                sendEvent('status', { message: 'Re-extracting verbatim sentences from top passages...' });
+                const topPassagesPrompt = docEvidenceList
+                  .filter((d) => d.topChunkText)
                   .map(
                     (d) =>
-                      `=== DOCUMENT ${d.index} (alias: ${d.alias}, file: ${d.name}) ===\n${d.evidence}`
+                      `=== DOCUMENT ${d.index} (alias: ${d.alias}, file: ${d.name}) ===\n${d.topChunkText}`
                   )
                   .join('\n\n');
 
-                const repairRes = await aiClient.createChatCompletion({
-                  messages: [
-                    {
-                      role: 'system',
-                      content:
-                        'Extract 1 to 4 EXACT, VERBATIM quotes from the contracts evidence that directly support the answer. For each quote, specify which document it came from using its alias (e.g. "DOC_1", "DOC_2"). Return ONLY a valid JSON object:\n{"citations": [{"id": 1, "doc": "DOC_1", "quote": "exact verbatim text"}]}',
-                    },
-                    {
-                      role: 'user',
-                      content: `ANSWER:\n${fullGeneratedText}\n\nCONTRACTS EVIDENCE:\n${combinedEvidence}`,
-                    },
-                  ],
-                  temperature: 0,
-                });
+                if (topPassagesPrompt.trim().length > 0) {
+                  const retryRes = await aiClient.createChatCompletion({
+                    messages: [
+                      {
+                        role: 'system',
+                        content:
+                          'From the provided text of each document, copy the exact sentence(s) answering the question, verbatim. For each quote, specify which document it came from using its alias (e.g. "DOC_1", "DOC_2"). Return ONLY a valid JSON object:\n{"citations": [{"id": 1, "doc": "DOC_1", "quote": "exact sentence verbatim"}]}',
+                      },
+                      {
+                        role: 'user',
+                        content: `QUESTION:\n${question}\n\nTOP PASSAGES:\n${topPassagesPrompt}`,
+                      },
+                    ],
+                    temperature: 0,
+                    responseFormatJson: true,
+                  });
 
-                const repairedPayload = parseQuotesPayload(repairRes.content || '', 'comparison');
-                for (let rIdx = 0; rIdx < repairedPayload.citations.length; rIdx++) {
-                  const rq = repairedPayload.citations[rIdx];
-                  if (!rq.quote) continue;
+                  const retryPayload = parseQuotesPayload(retryRes.content || '', 'comparison');
+                  const validRetry = retryPayload.citations.filter((c) => !isPlaceholderQuote(c.quote));
 
-                  const targetDoc = resolveDocumentFromAlias(rq.doc || rq.documentId, docEvidenceList);
-                  if (!targetDoc) continue;
+                  for (let rIdx = 0; rIdx < validRetry.length; rIdx++) {
+                    const rq = validRetry[rIdx];
+                    if (!rq.quote) continue;
 
-                  const rv = await verifyQuoteForDocument(targetDoc.id, rq.quote);
-                  if (rv.verified) {
-                    const support = checkQuoteSupport(question, fullGeneratedText, rv.quote, false);
-                    const repCit: VerifiedCitation = {
-                      id: `cit_${Date.now()}_rep_${rIdx}`,
-                      documentId: targetDoc.id,
-                      documentName: targetDoc.name,
-                      quote: rv.quote,
-                      verified: true,
-                      startOffset: rv.startOffset,
-                      endOffset: rv.endOffset,
-                      pageStart: rv.pageStart,
-                      pageEnd: rv.pageEnd,
-                      occurrences: rv.occurrences,
-                      supportStatus: support.supportStatus,
-                      supportWarning: support.warning,
-                    };
-                    collectedCitations.push(repCit);
-                    sendEvent('citation', repCit);
+                    const targetDoc = resolveDocumentFromAlias(rq.doc || rq.documentId, docEvidenceList);
+                    if (!targetDoc) continue;
+
+                    const rv = await verifyQuoteForDocument(targetDoc.id, rq.quote);
+                    if (rv.verified) {
+                      const support = checkQuoteSupport(question, fullGeneratedText, rv.quote, false);
+                      const repCit: VerifiedCitation = {
+                        id: `cit_${Date.now()}_rep_${rIdx}`,
+                        documentId: targetDoc.id,
+                        documentName: targetDoc.name,
+                        quote: rv.quote,
+                        verified: true,
+                        startOffset: rv.startOffset,
+                        endOffset: rv.endOffset,
+                        pageStart: rv.pageStart,
+                        pageEnd: rv.pageEnd,
+                        occurrences: rv.occurrences,
+                        supportStatus: support.supportStatus,
+                        supportWarning: support.warning,
+                      };
+                      collectedCitations.push(repCit);
+                      sendEvent('citation', repCit);
+                    }
                   }
                 }
-              } catch (repairErr) {
-                console.warn('[MultiDoc Repair] Repair pass failed:', repairErr);
+              } catch (retryErr) {
+                console.warn('[MultiDoc Retry] Fallback quote retry failed:', retryErr);
               }
+            }
+
+            if (collectedCitations.length === 0) {
+              sendEvent('notice', { message: 'No verified quotes could be located across the contracts.' });
             }
           } else {
             // --- Single Document QA with Coverage Honesty & Delimiter Streaming ---

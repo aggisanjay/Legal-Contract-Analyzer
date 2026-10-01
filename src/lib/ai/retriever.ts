@@ -6,6 +6,293 @@ export interface RetrievedChunk extends DocumentChunkData {
   score: number;
 }
 
+export const STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'both', 'but', 'by', 'can', 'could', 'did', 'do', 'does',
+  'for', 'from', 'had', 'has', 'have', 'how', 'if', 'in', 'into', 'is', 'it', 'its', 'of', 'on', 'or',
+  'over', 'than', 'that', 'the', 'their', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'were',
+  'what', 'when', 'where', 'which', 'who', 'whom', 'whose', 'why', 'will', 'with', 'would', 'between',
+  'differ', 'different', 'difference', 'differs', 'compare', 'compared', 'comparison', 'version',
+  'versions', 'document', 'documents', 'contract', 'contracts', 'agreement', 'same', 'longer', 'shorter',
+  'higher', 'lower', 'two', 'one',
+]);
+
+/**
+ * Light stemming: strips ing, ed, es, s from tokens
+ */
+export function lightStem(word: string): string {
+  const s = word.toLowerCase().trim();
+  if (s.length <= 3) return s;
+  if (s.endsWith('ing') && s.length > 5) {
+    return s.slice(0, -3);
+  }
+  if (s.endsWith('ed') && s.length > 4) {
+    return s.slice(0, -2);
+  }
+  if (s.endsWith('es') && s.length > 4) {
+    return s.slice(0, -2);
+  }
+  if (s.endsWith('s') && !s.endsWith('ss') && s.length > 3) {
+    return s.slice(0, -1);
+  }
+  return s;
+}
+
+export const LEGAL_SYNONYMS: Record<string, string[]> = {
+  cap: ['exceed', 'aggregate', 'limit', 'limitation'],
+  caps: ['exceed', 'aggregate', 'limit', 'limitation'],
+  notice: ['terminate', 'termination', 'days', 'convenience'],
+  notices: ['terminate', 'termination', 'days', 'convenience'],
+  termination: ['terminate', 'convenience', 'notice', 'days'],
+  terminate: ['termination', 'convenience', 'notice', 'days'],
+  convenience: ['terminate', 'termination', 'notice'],
+  law: ['governed', 'governing', 'laws', 'jurisdiction'],
+  laws: ['governed', 'governing', 'law', 'jurisdiction'],
+  governing: ['governed', 'laws', 'law', 'jurisdiction'],
+  governed: ['governing', 'laws', 'law', 'jurisdiction'],
+  liability: ['liable', 'limitation', 'aggregate', 'damages', 'cap', 'exceed'],
+  liable: ['liability', 'limitation', 'aggregate', 'damages'],
+  limit: ['limitation', 'liability', 'cap', 'aggregate'],
+  limitation: ['limit', 'liability', 'cap', 'aggregate'],
+  indemnity: ['indemnify', 'indemnified', 'harmless', 'defend'],
+  indemnify: ['indemnity', 'indemnified', 'harmless', 'defend'],
+  confidentiality: ['confidential', 'proprietary', 'disclosure', 'secret'],
+  confidential: ['confidentiality', 'proprietary', 'disclosure', 'secret'],
+  payment: ['fees', 'fee', 'invoice', 'invoices', 'due', 'pay'],
+  fees: ['payment', 'fee', 'invoice', 'invoices', 'pay'],
+  fee: ['payment', 'fees', 'invoice', 'pay'],
+  invoice: ['payment', 'fees', 'invoices', 'pay'],
+  assignment: ['assign', 'assigns', 'assigned', 'transfer'],
+  assign: ['assignment', 'assigns', 'assigned', 'transfer'],
+};
+
+export function tokenizeAndStem(text: string): string[] {
+  if (!text) return [];
+  const words = text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !STOPWORDS.has(w));
+  return words.map((w) => lightStem(w));
+}
+
+export function extractHeadingLines(text: string): string[] {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const headings: string[] = [];
+  for (let i = 0; i < Math.min(lines.length, 4); i++) {
+    const line = lines[i];
+    if (
+      /^(?:article|section|clause|\d+\.)/i.test(line) ||
+      (line.length < 80 && line === line.toUpperCase() && /[A-Z]/.test(line)) ||
+      (line.length < 80 && /^[A-Z][A-Za-z0-9\s.,:-]+[.:]?$/.test(line) && !line.includes('shall') && !line.includes('agree'))
+    ) {
+      headings.push(line);
+    }
+  }
+  const match = text.match(/^(?:ARTICLE|SECTION|CLAUSE|\d+\.)\s*[^.\n]+[.\n]/i);
+  if (match && !headings.includes(match[0].trim())) {
+    headings.push(match[0].trim());
+  }
+  return headings;
+}
+
+/**
+ * Scores chunk objects using Okapi BM25 (k1=1.2, b=0.75) with IDF computed over chunks,
+ * stopword filtering, light stemming, legal synonym expansion, section-title boost,
+ * and chunk heading bonuses.
+ */
+export function scoreChunksWithBM25(
+  chunks: Array<DocumentChunkData>,
+  query: string,
+  options?: {
+    isLocalHashVectorizer?: boolean;
+    queryEmbedding?: number[];
+  }
+): RetrievedChunk[] {
+  if (chunks.length === 0) return [];
+
+  // 1. Extract query words excluding stopwords
+  const rawWords = query
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !STOPWORDS.has(w));
+
+  const primaryTerms = Array.from(new Set(rawWords.map((w) => lightStem(w))));
+
+  // 2. Expand legal synonyms
+  const synonymTermsSet = new Set<string>();
+  for (const raw of rawWords) {
+    const rawSt = lightStem(raw);
+    const syns = LEGAL_SYNONYMS[raw] || LEGAL_SYNONYMS[rawSt] || [];
+    for (const syn of syns) {
+      const synSt = lightStem(syn);
+      if (!STOPWORDS.has(syn) && !primaryTerms.includes(synSt)) {
+        synonymTermsSet.add(synSt);
+      }
+    }
+  }
+  const synonymTerms = Array.from(synonymTermsSet);
+
+  if (primaryTerms.length === 0 && synonymTerms.length === 0) {
+    const fallback = query
+      .toLowerCase()
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 1);
+    primaryTerms.push(...fallback.map((w) => lightStem(w)));
+  }
+
+  // 3. Document statistics for BM25
+  const N = chunks.length;
+  const k1 = 1.2;
+  const b = 0.75;
+
+  const chunkTokenMaps: Array<{
+    tf: Map<string, number>;
+    length: number;
+    headingTokens: Set<string>;
+    sectionTitleTokens: Set<string>;
+  }> = [];
+
+  let totalLength = 0;
+  for (const chunk of chunks) {
+    const tokens = tokenizeAndStem(chunk.text);
+    const tf = new Map<string, number>();
+    for (const t of tokens) {
+      tf.set(t, (tf.get(t) || 0) + 1);
+    }
+
+    const headings = extractHeadingLines(chunk.text);
+    const headingTokens = new Set<string>();
+    for (const h of headings) {
+      for (const ht of tokenizeAndStem(h)) {
+        headingTokens.add(ht);
+      }
+    }
+
+    const sectionTitleTokens = new Set<string>(tokenizeAndStem(chunk.sectionTitle || ''));
+
+    chunkTokenMaps.push({
+      tf,
+      length: tokens.length,
+      headingTokens,
+      sectionTitleTokens,
+    });
+    totalLength += tokens.length;
+  }
+
+  const avgdl = Math.max(totalLength / N, 1);
+
+  // 4. Compute IDF for each query term over chunks
+  const idfMap = new Map<string, number>();
+  for (const term of [...primaryTerms, ...synonymTerms]) {
+    let docFreq = 0;
+    for (const c of chunkTokenMaps) {
+      if (c.tf.has(term)) {
+        docFreq++;
+      }
+    }
+    const idf = Math.log(1 + (N - docFreq + 0.5) / (docFreq + 0.5));
+    idfMap.set(term, idf);
+  }
+
+  // 5. Score each chunk
+  const scoredItems: Array<{
+    chunk: DocumentChunkData;
+    bm25: number;
+    semantic: number;
+  }> = [];
+
+  let maxBM25 = 0;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const { tf, length: dl, headingTokens, sectionTitleTokens } = chunkTokenMaps[i];
+
+    let bm25 = 0;
+
+    // Primary terms: weight 1.0
+    for (const term of primaryTerms) {
+      const freq = tf.get(term) || 0;
+      const idf = idfMap.get(term) || 0;
+      if (freq > 0) {
+        const tfScore = (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * (dl / avgdl)));
+        bm25 += 1.0 * idf * tfScore;
+      }
+      if (sectionTitleTokens.has(term)) {
+        bm25 += 2.5 * idf;
+      }
+      if (headingTokens.has(term)) {
+        bm25 += 3.5 * idf;
+      }
+    }
+
+    // Synonym terms: weight 0.75
+    for (const term of synonymTerms) {
+      const freq = tf.get(term) || 0;
+      const idf = idfMap.get(term) || 0;
+      if (freq > 0) {
+        const tfScore = (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * (dl / avgdl)));
+        bm25 += 0.75 * idf * tfScore;
+      }
+      if (sectionTitleTokens.has(term)) {
+        bm25 += 1.5 * idf;
+      }
+      if (headingTokens.has(term)) {
+        bm25 += 2.0 * idf;
+      }
+    }
+
+    if (bm25 > maxBM25) {
+      maxBM25 = bm25;
+    }
+
+    // Semantic cosine score if queryEmbedding provided
+    let semantic = 0;
+    if (options?.queryEmbedding && chunk.embedding) {
+      try {
+        const embeddingVector = Array.isArray(chunk.embedding)
+          ? chunk.embedding
+          : JSON.parse(chunk.embedding);
+        if (Array.isArray(embeddingVector) && embeddingVector.length > 0) {
+          semantic = cosineSimilarity(options.queryEmbedding, embeddingVector);
+        }
+      } catch {}
+    }
+
+    scoredItems.push({ chunk, bm25, semantic });
+  }
+
+  // 6. Combine scores
+  const isLocalHash = options?.isLocalHashVectorizer !== false;
+  const results: RetrievedChunk[] = [];
+
+  for (const item of scoredItems) {
+    let finalScore = item.bm25;
+    if (!isLocalHash && maxBM25 > 0) {
+      const normBM25 = item.bm25 / maxBM25;
+      finalScore = 0.7 * normBM25 + 0.3 * Math.max(0, item.semantic);
+    }
+
+    results.push({
+      id: item.chunk.id,
+      documentId: item.chunk.documentId,
+      chunkIndex: item.chunk.chunkIndex,
+      text: item.chunk.text,
+      pageStart: item.chunk.pageStart,
+      pageEnd: item.chunk.pageEnd,
+      startOffset: item.chunk.startOffset,
+      endOffset: item.chunk.endOffset,
+      sectionNumber: item.chunk.sectionNumber,
+      sectionTitle: item.chunk.sectionTitle,
+      score: finalScore,
+    });
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  return results;
+}
+
 /**
  * Retrieves top relevant chunks for a question using hybrid semantic + keyword scoring.
  */
@@ -28,69 +315,19 @@ export async function retrieveChunksForDocument(
   if (chunks.length === 0) return [];
 
   const embeddingProvider = getEmbeddingProvider();
-  const queryEmbedding = await embeddingProvider.generateEmbedding(query);
+  const isLocalHashVectorizer = embeddingProvider.name === 'fast-local-vector';
+  let queryEmbedding: number[] | undefined;
 
-  const queryTerms = query
-    .toLowerCase()
-    .replace(/[^\w\s]/g, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 2);
-
-  const scored: RetrievedChunk[] = [];
-
-  for (const chunk of chunks) {
-    let embeddingVector: number[] = [];
-    if (chunk.embedding) {
-      try {
-        embeddingVector = JSON.parse(chunk.embedding);
-      } catch {
-        embeddingVector = [];
-      }
-    }
-
-    // Semantic cosine score
-    const semanticScore = embeddingVector.length > 0
-      ? cosineSimilarity(queryEmbedding, embeddingVector)
-      : 0;
-
-    // Keyword / BM25 term overlap score
-    const textLower = chunk.text.toLowerCase();
-    let keywordScore = 0;
-    for (const term of queryTerms) {
-      if (textLower.includes(term)) {
-        keywordScore += 0.25;
-      }
-    }
-
-    // Section title boost
-    if (chunk.sectionTitle) {
-      const titleLower = chunk.sectionTitle.toLowerCase();
-      for (const term of queryTerms) {
-        if (titleLower.includes(term)) {
-          keywordScore += 0.5;
-        }
-      }
-    }
-
-    const totalScore = semanticScore * 0.6 + Math.min(keywordScore, 1.0) * 0.4;
-
-    scored.push({
-      id: chunk.id,
-      documentId: chunk.documentId,
-      chunkIndex: chunk.chunkIndex,
-      text: chunk.text,
-      pageStart: chunk.pageStart,
-      pageEnd: chunk.pageEnd,
-      startOffset: chunk.startOffset,
-      endOffset: chunk.endOffset,
-      sectionNumber: chunk.sectionNumber,
-      sectionTitle: chunk.sectionTitle,
-      score: totalScore,
-    });
+  if (!isLocalHashVectorizer) {
+    try {
+      queryEmbedding = await embeddingProvider.generateEmbedding(query);
+    } catch {}
   }
 
-  // Sort by score descending
-  scored.sort((a, b) => b.score - a.score);
+  const scored = scoreChunksWithBM25(chunks, query, {
+    isLocalHashVectorizer,
+    queryEmbedding,
+  });
 
   return scored.slice(0, topK);
 }
