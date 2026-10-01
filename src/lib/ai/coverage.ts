@@ -6,6 +6,7 @@ import {
   extractHeadingLines,
   tokenizeAndStem,
 } from './retriever';
+import { getEmbeddingProvider } from './embeddings';
 import { aiClient } from './client';
 import { formatPageRanges } from '../utils/format';
 export { formatPageRanges };
@@ -461,24 +462,19 @@ export async function executeTargetedRetrieval(
   const maxPrimaryHits = options?.maxPrimaryHits ?? (isMultiDoc ? 6 : Math.max(8, Math.min(25, Math.ceil(totalChunks * 0.12))));
   const minScoreRatio = options?.minScoreRatio ?? 0.25;
 
-  let scoredAll: Array<{
-    id: string;
-    chunkIndex: number;
-    text: string;
-    pageStart: number;
-    pageEnd: number;
-    score: number;
-    sectionNumber?: number | string | null;
-    sectionTitle?: string | null;
-    startOffset?: number;
-    endOffset?: number;
-  }> = [];
-
-  if (options?.allChunks) {
-    scoredAll = scoreChunksWithBM25(options.allChunks as any, question);
-  } else {
-    scoredAll = await retrieveChunksForDocument(documentId, question, Math.max(maxPrimaryHits * 3, 20));
+  const embeddingProvider = getEmbeddingProvider();
+  const isLocalHashVectorizer = embeddingProvider.name === 'fast-local-vector';
+  let queryEmbedding: number[] | undefined;
+  if (!isLocalHashVectorizer) {
+    try {
+      queryEmbedding = await embeddingProvider.generateEmbedding(question);
+    } catch {}
   }
+
+  const scoredAll = scoreChunksWithBM25(allChunks as any, question, {
+    isLocalHashVectorizer,
+    queryEmbedding,
+  });
 
   // Drop primary hits whose normalized score is below 25% of the best score, so weak matches don't fill the budget
   const bestScore = scoredAll.length > 0 ? scoredAll[0].score : 0;
