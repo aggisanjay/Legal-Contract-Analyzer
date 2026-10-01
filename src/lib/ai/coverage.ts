@@ -206,6 +206,94 @@ export function parseQuotesPayload(
   return { answerType, citations };
 }
 
+export interface DocumentCandidateRef {
+  id: string;
+  name?: string;
+  filename?: string;
+  title?: string;
+  alias?: string;
+  index?: number;
+}
+
+/**
+ * Resolves a raw document identifier or alias into an exact document ID and name.
+ * Supported formats:
+ * - "DOC_1", "DOC_2", etc.
+ * - Exact database ID
+ * - Filename or title substring (e.g. "contract-v2.pdf", "v2")
+ * - "Document 1", "Document 2", "Doc 1", "Doc 2"
+ * - "Document A", "Document B", "Doc A", "Doc B"
+ * - 1-based numeric index: "1", "2", 1, 2
+ *
+ * If unresolvable, returns null (never default to doc 1).
+ */
+export function resolveDocumentFromAlias(
+  rawDoc: string | number | undefined | null,
+  docList: DocumentCandidateRef[]
+): { id: string; name: string } | null {
+  if (rawDoc === undefined || rawDoc === null) return null;
+  const raw = String(rawDoc).trim();
+  if (!raw) return null;
+  const rawLower = raw.toLowerCase();
+
+  // 1. Exact database ID match
+  const exactMatch = docList.find((d) => d.id === raw);
+  if (exactMatch) {
+    return { id: exactMatch.id, name: exactMatch.name || exactMatch.filename || exactMatch.title || exactMatch.id };
+  }
+
+  // 2. Explicit alias match: "DOC_1", "DOC_2", etc.
+  for (let i = 0; i < docList.length; i++) {
+    const d = docList[i];
+    const expectedAlias = (d.alias || `DOC_${i + 1}`).toLowerCase();
+    if (rawLower === expectedAlias || rawLower === `doc_${i + 1}`) {
+      return { id: d.id, name: d.name || d.filename || d.title || d.id };
+    }
+  }
+
+  // 3. Document 1 / Document 2 / Doc 1 / Doc 2 (1-based index)
+  const docNumMatch = rawLower.match(/^(?:document|doc)[_\s-]*([0-9]+)$/i);
+  if (docNumMatch) {
+    const idx = parseInt(docNumMatch[1], 10) - 1;
+    if (idx >= 0 && idx < docList.length) {
+      const d = docList[idx];
+      return { id: d.id, name: d.name || d.filename || d.title || d.id };
+    }
+  }
+
+  // 4. Document A / Document B / Doc A / Doc B
+  const docLetterMatch = rawLower.match(/^(?:document|doc)[_\s-]*([a-z])$/i);
+  if (docLetterMatch) {
+    const idx = docLetterMatch[1].charCodeAt(0) - 'a'.charCodeAt(0);
+    if (idx >= 0 && idx < docList.length) {
+      const d = docList[idx];
+      return { id: d.id, name: d.name || d.filename || d.title || d.id };
+    }
+  }
+
+  // 5. Pure 1-based index: "1", "2", 1, 2
+  if (/^[0-9]+$/.test(raw)) {
+    const idx = parseInt(raw, 10) - 1;
+    if (idx >= 0 && idx < docList.length) {
+      const d = docList[idx];
+      return { id: d.id, name: d.name || d.filename || d.title || d.id };
+    }
+  }
+
+  // 6. Filename or title match / substring
+  for (const d of docList) {
+    const docName = d.name || d.filename || d.title;
+    if (docName) {
+      const docNameLower = docName.toLowerCase();
+      if (rawLower === docNameLower || docNameLower.includes(rawLower) || rawLower.includes(docNameLower)) {
+        return { id: d.id, name: docName };
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Strategy A: Targeted Question Retrieval with Top-K scaling and neighbor chunks (±1).
  */

@@ -8,11 +8,13 @@ import {
   executeTargetedRetrieval,
   executeMapReduceRetrieval,
   enforceAbsenceCoverage,
+  isAbsenceClaim,
+  parseQuotesPayload,
+  resolveDocumentFromAlias,
 } from '@/lib/ai/coverage';
 import { CONTRACT_QA_SYSTEM_PROMPT, MULTI_DOC_QA_SYSTEM_PROMPT } from '@/lib/ai/prompts';
 import { runAgenticDocumentResearch } from '@/lib/ai/agent';
 import { verifyQuoteForDocument } from '@/lib/quotes/quote-verifier';
-import { isAbsenceClaim } from '@/lib/ai/coverage';
 import { VerifiedCitation } from '@/lib/types';
 import { deduplicateVerifiedCitations, normalizeQuoteForDedup } from '@/lib/utils/format';
 import { checkQuoteSupport, sanitizeProcessDescriptions } from '@/lib/quotes/quote-support';
@@ -216,9 +218,17 @@ export async function POST(req: NextRequest) {
             // --- Multi-Document Analysis ---
             sendEvent('status', { message: `Retrieving evidence across ${docIds.length} contracts...` });
 
-            const docEvidenceList: Array<{ id: string; name: string; evidence: string; pageCount: number }> = [];
+            const docEvidenceList: Array<{
+              id: string;
+              name: string;
+              alias: string;
+              index: number;
+              evidence: string;
+              pageCount: number;
+            }> = [];
 
-            for (const dId of docIds) {
+            for (let i = 0; i < docIds.length; i++) {
+              const dId = docIds[i];
               const doc = await prisma.document.findUnique({
                 where: { id: dId },
                 select: { id: true, originalFilename: true, pageCount: true },
@@ -227,11 +237,15 @@ export async function POST(req: NextRequest) {
 
               sendEvent('status', { message: `Searching "${doc.originalFilename}"...` });
               const chunks = await retrieveChunksForDocument(dId, question, 6);
-              const text = chunks.map((c) => `[Page ${c.pageStart}]\n${c.text}`).join('\n---\n');
+              const text = chunks.length > 0
+                ? chunks.map((c) => `[Page ${c.pageStart}]\n${c.text}`).join('\n---\n')
+                : `Not found in ${doc.originalFilename}`;
 
               docEvidenceList.push({
                 id: doc.id,
                 name: doc.originalFilename,
+                alias: `DOC_${i + 1}`,
+                index: i + 1,
                 evidence: text,
                 pageCount: doc.pageCount,
               });
@@ -249,7 +263,7 @@ export async function POST(req: NextRequest) {
                   docEvidenceList
                     .map(
                       (d) =>
-                        `### Contract: "${d.name}" (documentId: "${d.id}")\n${d.evidence}`
+                        `=== DOCUMENT ${d.index} (alias: ${d.alias}, file: ${d.name}) ===\n${d.evidence}`
                     )
                     .join('\n\n'),
               },
@@ -298,34 +312,27 @@ export async function POST(req: NextRequest) {
             // Verify candidate quotes for multi-document mode
             sendEvent('status', { message: 'Verifying quotations against each contract...' });
 
-            let candidateCitations: Array<{ id?: number; documentId?: string; quote: string }> = [];
-            if (quotesJsonBuffer.trim().length > 0) {
+            let parsedPayload = parseQuotesPayload(quotesJsonBuffer, 'comparison');
+            let candidateCitations = parsedPayload.citations;
+
+            // If no citations parsed, attempt quick fallback repair
+            if (candidateCitations.length === 0 && quotesJsonBuffer.trim().length > 0) {
               try {
-                const jsonMatch = quotesJsonBuffer.match(/\[[\s\S]*\]/);
-                if (jsonMatch) {
-                  candidateCitations = JSON.parse(jsonMatch[0]);
-                }
+                const repair = await aiClient.createChatCompletion({
+                  messages: [
+                    {
+                      role: 'system',
+                      content:
+                        'Extract candidate quotes as a valid JSON object: {"answerType": "comparison", "citations": [{"id": 1, "doc": "DOC_1", "quote": "verbatim text"}]}. Return ONLY valid JSON.',
+                    },
+                    { role: 'user', content: quotesJsonBuffer },
+                  ],
+                  temperature: 0,
+                });
+                parsedPayload = parseQuotesPayload(repair.content || '', 'comparison');
+                candidateCitations = parsedPayload.citations;
               } catch {
-                // Retry once with repair prompt
-                try {
-                  const repair = await aiClient.createChatCompletion({
-                    messages: [
-                      {
-                        role: 'system',
-                        content:
-                          'Extract candidate quotes as a valid JSON array of objects: [{"id": 1, "documentId": "string", "quote": "string"}]. Return ONLY the valid JSON array.',
-                      },
-                      { role: 'user', content: quotesJsonBuffer },
-                    ],
-                    temperature: 0,
-                  });
-                  const repMatch = repair.content?.match(/\[[\s\S]*\]/);
-                  if (repMatch) {
-                    candidateCitations = JSON.parse(repMatch[0]);
-                  }
-                } catch {
-                  sendEvent('notice', { message: 'No verifiable quotes could be produced.' });
-                }
+                sendEvent('notice', { message: 'No verifiable quotes could be produced.' });
               }
             }
 
@@ -334,17 +341,18 @@ export async function POST(req: NextRequest) {
               const cand = candidateCitations[i];
               if (!cand.quote) continue;
 
-              // Rule: NEVER fall back to docEvidenceList[0] when documentId is missing or unknown.
-              // Reject that quote as unverified with reason "unknown document".
-              const targetDocInfo = docEvidenceList.find((d) => d.id === cand.documentId);
-              if (!cand.documentId || !targetDocInfo) {
+              const targetDocInfo = resolveDocumentFromAlias(cand.doc || cand.documentId, docEvidenceList);
+              if (!targetDocInfo) {
+                console.warn(
+                  `[quote-verify] Multi-doc quote rejected: unknown document (alias provided: "${cand.doc || cand.documentId}")`
+                );
                 const unv = {
                   id: `unv_${Date.now()}_${i}`,
-                  documentId: cand.documentId || 'unknown',
+                  documentId: cand.doc || cand.documentId || 'unknown',
                   documentName: 'Unknown Document',
                   quote: cand.quote,
                   verified: false as const,
-                  reason: 'unknown document (no valid documentId provided)',
+                  reason: 'unknown document',
                   citationNumber: cand.id || i + 1,
                 };
                 collectedUnverified.push(unv);
@@ -358,8 +366,8 @@ export async function POST(req: NextRequest) {
 
               const vResult = await verifyQuoteForDocument(targetDocInfo.id, cand.quote);
               if (vResult.verified) {
-                const isAbsence = isAbsenceClaim(fullGeneratedText);
-                const support = checkQuoteSupport(question, fullGeneratedText, vResult.quote, isAbsence);
+                // In comparison mode, quotes are never marked absent
+                const support = checkQuoteSupport(question, fullGeneratedText, vResult.quote, false);
                 const cit: VerifiedCitation = {
                   id: `cit_${Date.now()}_${i}`,
                   documentId: targetDocInfo.id,
@@ -377,6 +385,9 @@ export async function POST(req: NextRequest) {
                 collectedCitations.push(cit);
                 sendEvent('citation', cit);
               } else {
+                console.log(
+                  `[quote-verify] Doc ${cand.doc || targetDocInfo.name} quote rejected: ${vResult.reason} in ${targetDocInfo.name} (normalized quote length: ${cand.quote.trim().length})`
+                );
                 const unv = {
                   id: `unv_${Date.now()}_${i}`,
                   documentId: targetDocInfo.id,
@@ -388,6 +399,68 @@ export async function POST(req: NextRequest) {
                 };
                 collectedUnverified.push(unv);
                 sendEvent('unverified', unv);
+              }
+            }
+
+            // Multi-doc quote repair pass:
+            // When candidate quotes were emitted but ALL of them failed verification,
+            // make a single quick repair call to re-quote verbatim from the evidence passages.
+            if (collectedCitations.length === 0 && candidateCitations.length > 0) {
+              try {
+                sendEvent('status', { message: 'Re-quoting verbatim from contracts evidence...' });
+                const combinedEvidence = docEvidenceList
+                  .map(
+                    (d) =>
+                      `=== DOCUMENT ${d.index} (alias: ${d.alias}, file: ${d.name}) ===\n${d.evidence}`
+                  )
+                  .join('\n\n');
+
+                const repairRes = await aiClient.createChatCompletion({
+                  messages: [
+                    {
+                      role: 'system',
+                      content:
+                        'Extract 1 to 4 EXACT, VERBATIM quotes from the contracts evidence that directly support the answer. For each quote, specify which document it came from using its alias (e.g. "DOC_1", "DOC_2"). Return ONLY a valid JSON object:\n{"citations": [{"id": 1, "doc": "DOC_1", "quote": "exact verbatim text"}]}',
+                    },
+                    {
+                      role: 'user',
+                      content: `ANSWER:\n${fullGeneratedText}\n\nCONTRACTS EVIDENCE:\n${combinedEvidence}`,
+                    },
+                  ],
+                  temperature: 0,
+                });
+
+                const repairedPayload = parseQuotesPayload(repairRes.content || '', 'comparison');
+                for (let rIdx = 0; rIdx < repairedPayload.citations.length; rIdx++) {
+                  const rq = repairedPayload.citations[rIdx];
+                  if (!rq.quote) continue;
+
+                  const targetDoc = resolveDocumentFromAlias(rq.doc || rq.documentId, docEvidenceList);
+                  if (!targetDoc) continue;
+
+                  const rv = await verifyQuoteForDocument(targetDoc.id, rq.quote);
+                  if (rv.verified) {
+                    const support = checkQuoteSupport(question, fullGeneratedText, rv.quote, false);
+                    const repCit: VerifiedCitation = {
+                      id: `cit_${Date.now()}_rep_${rIdx}`,
+                      documentId: targetDoc.id,
+                      documentName: targetDoc.name,
+                      quote: rv.quote,
+                      verified: true,
+                      startOffset: rv.startOffset,
+                      endOffset: rv.endOffset,
+                      pageStart: rv.pageStart,
+                      pageEnd: rv.pageEnd,
+                      occurrences: rv.occurrences,
+                      supportStatus: support.supportStatus,
+                      supportWarning: support.warning,
+                    };
+                    collectedCitations.push(repCit);
+                    sendEvent('citation', repCit);
+                  }
+                }
+              } catch (repairErr) {
+                console.warn('[MultiDoc Repair] Repair pass failed:', repairErr);
               }
             }
           } else {
@@ -597,6 +670,7 @@ export async function POST(req: NextRequest) {
           // If ALL quotes fail verification for an answer that is not a "not found" answer,
           // run ONE retry that asks the model to re-quote verbatim from the evidence text supplied, then re-verify.
           if (
+            !isMultiDoc &&
             collectedCitations.length === 0 &&
             !isNotFoundAnswer &&
             fullGeneratedText.trim().length > 0 &&
