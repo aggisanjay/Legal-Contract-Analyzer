@@ -48,12 +48,21 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    // Case 2: List conversations for a document (including multi-doc ones that include it)
-    if (!documentId) {
-      return NextResponse.json({ error: 'documentId or conversationId is required' }, { status: 400 });
+    // Case 2: List conversations or get latest conversation for document(s)
+    const documentIdsParam = searchParams.get('documentIds');
+    const isLatest = searchParams.get('latest') === 'true';
+
+    const targetDocIds = documentIdsParam
+      ? documentIdsParam.split(',').map((s) => s.trim()).filter(Boolean)
+      : documentId
+      ? [documentId]
+      : [];
+
+    if (targetDocIds.length === 0) {
+      return NextResponse.json({ error: 'documentId, documentIds, or conversationId is required' }, { status: 400 });
     }
 
-    // Fetch conversations where documentId equals target, or multi-doc conversations that include it
+    // Fetch conversations where documentId equals target, or multi-doc conversations that include them
     const allConvs = await prisma.conversation.findMany({
       orderBy: { updatedAt: 'desc' },
       include: {
@@ -64,10 +73,61 @@ export async function GET(req: NextRequest) {
     });
 
     const relevant = allConvs.filter((c) => {
-      if (c.documentId === documentId) return true;
-      if (Array.isArray(c.documentIds) && (c.documentIds as string[]).includes(documentId)) return true;
-      return false;
+      if (targetDocIds.length > 1) {
+        if (Array.isArray(c.documentIds)) {
+          const convDocIds = c.documentIds as string[];
+          return targetDocIds.every((id) => convDocIds.includes(id));
+        }
+        return false;
+      } else {
+        const singleId = targetDocIds[0];
+        if (c.documentId === singleId) return true;
+        if (Array.isArray(c.documentIds) && (c.documentIds as string[]).includes(singleId)) return true;
+        return false;
+      }
     });
+
+    // If latest=true, return the latest conversation with all its messages
+    if (isLatest) {
+      if (relevant.length === 0) {
+        return NextResponse.json({ conversation: null, messages: [] });
+      }
+
+      const latestConv = await prisma.conversation.findUnique({
+        where: { id: relevant[0].id },
+        include: {
+          messages: {
+            orderBy: { createdAt: 'asc' },
+          },
+        },
+      });
+
+      if (!latestConv) {
+        return NextResponse.json({ conversation: null, messages: [] });
+      }
+
+      return NextResponse.json({
+        conversation: {
+          id: latestConv.id,
+          title: latestConv.title,
+          documentId: latestConv.documentId,
+          documentIds: latestConv.documentIds,
+          createdAt: latestConv.createdAt,
+          updatedAt: latestConv.updatedAt,
+        },
+        messages: latestConv.messages.map((m) => ({
+          id: m.id,
+          conversationId: m.conversationId,
+          role: m.role,
+          content: normalizeCitationMarkers(m.content),
+          citations: m.citations,
+          interrupted: m.interrupted,
+          verifiedCount: m.verifiedCount,
+          unverifiedCount: m.unverifiedCount,
+          createdAt: m.createdAt,
+        })),
+      });
+    }
 
     const mapped = relevant.map((c) => ({
       id: c.id,

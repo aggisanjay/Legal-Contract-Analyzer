@@ -204,8 +204,8 @@ export default function Home() {
   };
 
   const handleSelectCitation = (citation: VerifiedCitation) => {
-    // If citation belongs to a different document than active, switch active document
-    if (citation.documentId !== activeDocumentId) {
+    // If citation belongs to a different document than active, switch active document in viewer
+    if (citation.documentId && citation.documentId !== activeDocumentId) {
       setActiveDocumentId(citation.documentId);
     }
     setActiveCitation(citation);
