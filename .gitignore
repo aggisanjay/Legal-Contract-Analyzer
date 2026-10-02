@@ -42,3 +42,6 @@ storage/uploads/*
 !storage/uploads/.gitkeep
 storage/rendered/*
 !storage/rendered/.gitkeep
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
