@@ -81,7 +81,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const isMultiDoc = selectedDocuments.length > 1;
-  const readyDocs = selectedDocuments.filter((d) => d.status === 'READY');
+  const readyDocs = useMemo(
+    () => selectedDocuments.filter((d) => d.status === 'READY'),
+    [selectedDocuments]
+  );
   const canChat = (activeDocument?.status === 'READY') || readyDocs.length > 0;
 
   // 1-Click Clipboard Copy Handler
@@ -138,40 +141,34 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
     return activeDocument?.id || null;
   }, [selectedDocuments, activeDocument?.id]);
 
-  const currentContextRef = useRef<string | null>(null);
-
   // Load chat history ONLY when the chat context (selected document/documents) actually changes
   useEffect(() => {
     if (!chatContextKey) {
-      if (currentContextRef.current !== null) {
-        setMessages([]);
-        setConversationId(null);
-        setCurrentTimeline([]);
-        currentContextRef.current = null;
-      }
+      setMessages([]);
+      setConversationId(null);
+      setCurrentTimeline([]);
+      setIsLoadingHistory(false);
       return;
     }
-
-    // Crucial: If the context key is unchanged (e.g. user clicked "Open in document" or switched tabs in the viewer
-    // during a multi-document review), DO NOT reload or wipe the active conversation!
-    if (currentContextRef.current === chatContextKey) {
-      return;
-    }
-
-    currentContextRef.current = chatContextKey;
 
     let isMounted = true;
     setIsLoadingHistory(true);
 
     async function loadLatestConversation() {
       try {
-        const readyIds = readyDocs.map((d) => d.id);
-        const url = isMultiDoc && readyIds.length > 1
+        const readyIds = selectedDocuments.filter((d) => d.status === 'READY').map((d) => d.id);
+        const url = selectedDocuments.length > 1 && readyIds.length > 1
           ? `/api/chat/history?documentIds=${readyIds.join(',')}&latest=true`
           : `/api/chat/history?documentId=${chatContextKey}&latest=true`;
 
         const res = await fetch(url);
-        if (!res.ok) return;
+        if (!res.ok) {
+          if (isMounted) {
+            setConversationId(null);
+            setMessages([]);
+          }
+          return;
+        }
         const data = await res.json();
         if (isMounted) {
           if (data.conversation) {
@@ -185,7 +182,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
       } catch (err) {
         console.warn('Failed to load chat history:', err);
       } finally {
-        if (isMounted) setIsLoadingHistory(false);
+        if (isMounted) {
+          setIsLoadingHistory(false);
+        }
       }
     }
 
@@ -193,8 +192,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
     return () => {
       isMounted = false;
+      setIsLoadingHistory(false);
     };
-  }, [chatContextKey, isMultiDoc, readyDocs]);
+  }, [chatContextKey]);
 
   // Auto-scroll when new tokens/messages arrive unless user scrolled up
   useEffect(() => {

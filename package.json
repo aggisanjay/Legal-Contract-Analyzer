@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "node api.js && next dev",
+    "build": "node api.js && next build",
     "postinstall": "prisma generate",
-    "start": "next start",
+    "start": "node api.js && next start",
     "lint": "next lint",
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
