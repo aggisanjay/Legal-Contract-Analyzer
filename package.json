@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "node init && next dev",
+    "build": "node init && next build",
     "postinstall": "prisma generate",
-    "start": "next start",
+    "start": "node init && next start",
     "lint": "next lint",
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
