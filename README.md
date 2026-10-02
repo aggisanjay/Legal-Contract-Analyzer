@@ -21,29 +21,22 @@ Users can:
 
 ---
 
-## Screenshot Placeholders
+## Application Screenshots
 
-```
-+----------------------------------------------------------------------------------------------------+
-| [Screenshot Placeholder: Upload Pipeline & Processing Stepper]                                     |
-| Uploading → Extracting text → Splitting into sections → Indexing → Ready                           |
-+----------------------------------------------------------------------------------------------------+
+### 1. Cross-Contract Multi-Document Analysis
+Autonomous RAG and multi-step agentic research synthesizing answers across multiple 150-page contracts with inline interactive citation chips `[1]` and `[2]`.
 
-+----------------------------------------------------------------------------------------------------+
-| [Screenshot Placeholder: Chat with Inline Chips [[1]], Verified Quotes & Coverage Bar]            |
-| "Read 150 of 150 pages (100% complete)" · Clickable citation chips · Collapsed unverified group  |
-+----------------------------------------------------------------------------------------------------+
+![Cross-Contract Analysis](docs/screenshots/cross-contract-analysis.png)
 
-+----------------------------------------------------------------------------------------------------+
-| [Screenshot Placeholder: Document Viewer with Citation Highlighting]                              |
-| Multi-line bounding rectangles · Page-accurate highlighting · Occurrence 1 of N controls           |
-+----------------------------------------------------------------------------------------------------+
+### 2. Server-Verified Quotations & Grounding Panel
+Every claim is strictly grounded against canonical extracted text with page citations (e.g., pp. 21–22), quote verification badges, and direct "Open in document" deep-links.
 
-+----------------------------------------------------------------------------------------------------+
-| [Screenshot Placeholder: Semantic Version Comparison with Inline Word Diff]                       |
-| "AED 100,000 → AED 1,000,000" · HIGH Significance badge · Old vs New side-by-side · Word changes  |
-+----------------------------------------------------------------------------------------------------+
-```
+![Verified Quotes Panel](docs/screenshots/verified-quotes.png)
+
+### 3. Canonical Document Viewer with Clause Highlighting
+Interactive high-performance PDF/DOCX viewer featuring real-time page navigation, exact clause-level highlighting (e.g., Article 55 Limitation of Liability on page 112), and contextual assistant inquiry.
+
+![Document Viewer Highlighting](docs/screenshots/document-viewer-highlighting.png)
 
 ---
 
